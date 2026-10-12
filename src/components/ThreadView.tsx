@@ -83,7 +83,10 @@ function MessageCard({ message, startOpen }: { message: MessageDetail; startOpen
       <button type="button" className="flex w-full items-start gap-3 px-4 py-3 text-left" onClick={() => setOpen((value) => !value)}>
         <span className="grid h-9 w-9 shrink-0 place-items-center rounded-full text-xs font-semibold text-white" style={{ background: mail.thread?.accountColor }}>{initials(message.fromName, message.fromEmail)}</span>
         <span className="min-w-0 flex-1">
-          <span className="block font-medium">{personName(message.fromName, message.fromEmail)}</span>
+          <span className="block truncate">
+            <span className="font-medium">{personName(message.fromName, message.fromEmail)}</span>
+            {open && message.fromName.trim() && <span className="ml-2 text-sm text-muted">{message.fromEmail}</span>}
+          </span>
           {!open && <span className="block truncate text-sm text-muted">{message.snippet}</span>}
           {open && <span className="block text-sm text-muted">to {formatPeople(message.to) || "undisclosed"}{message.cc.length > 0 ? `, cc ${formatPeople(message.cc)}` : ""}</span>}
         </span>
