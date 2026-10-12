@@ -1,0 +1,108 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  color-scheme: light;
+  --bg: #efeae1;
+  --panel: #fbf9f4;
+  --rail: #e6e0d4;
+  --side: #f3efe6;
+  --line: #e0d8cb;
+  --text: #1e1a15;
+  --muted: #746c60;
+  --accent: #c9842a;
+  --accent-ink: #2a1c08;
+  --hover: #f3ecdf;
+  --selected: #f6e3c6;
+  --danger: #a33b32;
+  --star: #d39a14;
+  --row-h: 44px;
+  --shadow: 0 18px 50px rgba(48, 32, 12, 0.16);
+}
+
+:root[data-density="comfortable"] { --row-h: 56px; }
+:root[data-density="compact"] { --row-h: 32px; }
+
+.dark {
+  color-scheme: dark;
+  --bg: #12110f;
+  --panel: #1c1b18;
+  --rail: #10100e;
+  --side: #171614;
+  --line: #2e2b26;
+  --text: #f4f0e7;
+  --muted: #a69d90;
+  --accent: #e2a85a;
+  --accent-ink: #1a1208;
+  --hover: #26231e;
+  --selected: #3a2e1c;
+  --danger: #e07a72;
+  --star: #e2b340;
+  --shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
+}
+
+@theme inline {
+  --font-sans: "Segoe UI Variable", "Segoe UI", sans-serif;
+  --color-bg: var(--bg);
+  --color-panel: var(--panel);
+  --color-rail: var(--rail);
+  --color-side: var(--side);
+  --color-line: var(--line);
+  --color-ink: var(--text);
+  --color-muted: var(--muted);
+  --color-accent: var(--accent);
+  --color-accent-ink: var(--accent-ink);
+  --color-hover: var(--hover);
+  --color-selected: var(--selected);
+  --color-danger: var(--danger);
+  --color-star: var(--star);
+}
+
+* { box-sizing: border-box; }
+html, body, #root { height: 100%; }
+body { margin: 0; font-family: var(--font-sans); background: var(--bg); color: var(--text); }
+/* The notification pop-up window is transparent; only its cards are drawn. */
+:root.popup-window, :root.popup-window body { background: transparent; overflow: hidden; user-select: none; }
+@layer base {
+  button, input, textarea { font: inherit; color: inherit; }
+  button { cursor: pointer; }
+}
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--muted) 45%, transparent); border-radius: 99px; }
+
+.mail-row { height: var(--row-h); font-size: 0.875rem; }
+/* Shared controls sit in the components layer so Tailwind utilities can override them. */
+@layer components {
+  .icon-btn {
+    display: grid;
+    place-items: center;
+    width: 32px;
+    height: 32px;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--muted);
+  }
+  .icon-btn:hover { background: var(--hover); color: var(--text); }
+  .tool-btn {
+    height: 32px;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--muted);
+    padding: 0 8px;
+  }
+  .tool-btn:hover { background: var(--hover); color: var(--text); }
+  .icon-btn:disabled,
+  .tool-btn:disabled { opacity: 0.4; cursor: default; background: transparent; color: var(--muted); }
+  .field {
+    width: 100%;
+    border: 1px solid var(--line);
+    background: var(--panel);
+    border-radius: 10px;
+    padding: 8px 10px;
+    outline: none;
+  }
+  .field:focus { border-color: var(--accent); }
+}
