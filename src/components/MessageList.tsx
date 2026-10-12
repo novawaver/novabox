@@ -172,7 +172,14 @@ export function MessageList({ className = "" }: { className?: string }) {
                 <span className="font-normal text-muted"> — {thread.snippet}</span>
                 {thread.hasAttachments && <span className="ml-1 inline-block align-middle text-muted"><IconPaperclip /></span>}
               </div>
-              <div className="pr-2 text-xs text-muted">{thread.snoozeUntil ? `Until ${formatListDate(thread.snoozeUntil)}` : thread.scheduledId ? `Sends ${formatListDate(thread.date)}` : formatListDate(thread.date)}</div>
+              <div className="flex items-center gap-2 pr-2 text-xs text-muted">
+                {!mail.query.accountId && (
+                  <span className="max-w-45 truncate rounded-full px-2 py-0.5 font-medium text-white" style={{ background: thread.accountColor }} title={thread.accountEmail}>
+                    {thread.accountEmail}
+                  </span>
+                )}
+                {thread.snoozeUntil ? `Until ${formatListDate(thread.snoozeUntil)}` : thread.scheduledId ? `Sends ${formatListDate(thread.date)}` : formatListDate(thread.date)}
+              </div>
             </div>
           );
         })}
