@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, type MouseEvent } from "react";
 import { initials } from "../format";
+import { Overlay } from "./Dialogs";
 import { IconPlus, IconX } from "./Icons";
 import { useMail } from "../state/MailProvider";
 import type { Account } from "../types";
@@ -9,6 +10,7 @@ type MenuState = { account: Account; x: number; y: number; keyboard: boolean };
 export function AccountRail() {
   const mail = useMail();
   const [menu, setMenu] = useState<MenuState | null>(null);
+  const [confirmSignIn, setConfirmSignIn] = useState(false);
   const total = mail.accounts.reduce((sum, account) => sum + account.unread, 0);
   return (
     <aside className="flex w-[72px] shrink-0 flex-col items-center gap-2 border-r border-line bg-rail py-3">
@@ -37,7 +39,7 @@ export function AccountRail() {
         type="button"
         title={mail.signInBusy ? "Cancel Google sign-in" : "Add Gmail account"}
         aria-label={mail.signInBusy ? "Cancel Google sign-in" : "Add Gmail account"}
-        onClick={() => (mail.signInBusy ? mail.cancelSignIn() : void mail.signIn())}
+        onClick={() => (mail.signInBusy ? mail.cancelSignIn() : setConfirmSignIn(true))}
         className={`group relative mt-auto grid h-11 w-11 shrink-0 place-items-center rounded-full border-2 transition-all duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-rail ${
           mail.signInBusy
             ? "border-danger/60 bg-panel text-danger hover:bg-danger hover:text-white"
@@ -54,6 +56,25 @@ export function AccountRail() {
         )}
       </button>
       {menu && <AccountMenu {...menu} onClose={() => setMenu(null)} />}
+      {confirmSignIn && (
+        <Overlay title="Add Gmail account" onClose={() => setConfirmSignIn(false)}>
+          <p className="text-sm text-muted">Novabox will open Google sign-in in your browser. Come back to this window when you're done.</p>
+          <div className="mt-5 flex justify-end gap-2">
+            <button type="button" className="rounded-full px-4 py-2" onClick={() => setConfirmSignIn(false)}>Cancel</button>
+            <button
+              type="button"
+              autoFocus
+              className="rounded-full bg-accent px-4 py-2 font-semibold text-accent-ink"
+              onClick={() => {
+                setConfirmSignIn(false);
+                void mail.signIn();
+              }}
+            >
+              Continue to browser
+            </button>
+          </div>
+        </Overlay>
+      )}
     </aside>
   );
 }
