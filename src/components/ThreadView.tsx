@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useRef, useState, type SyntheticEvent } from "react";
 import { useDismiss } from "../useDismiss";
 import { formatBytes, formatFullDate, formatPeople, initials, personName } from "../format";
-import { blockPageMenu } from "../platform";
+import { blockPageMenu, openExternal } from "../platform";
 import { cleanEmail } from "../sanitize";
 import { IconArchive, IconBack, IconStar, IconTrash } from "./Icons";
 import { WhenMenu } from "./WhenMenu";
@@ -155,26 +155,30 @@ function MessageCard({ message, startOpen }: { message: MessageDetail; startOpen
   );
 }
 
+// The webview won't open new windows from the frame, so links go to the system browser instead.
+function openLink(event: MouseEvent) {
+  if (event.button > 1) return;
+  const link = (event.target as Element | null)?.closest?.("a[href]");
+  if (!link) return;
+  event.preventDefault();
+  void openExternal(link.getAttribute("href")!);
+}
+
 function EmailFrame({ html }: { html: string }) {
-  const [frame, setFrame] = useState<HTMLIFrameElement | null>(null);
-  useEffect(() => {
-    if (!frame) return;
-    const fit = () => {
-      const height = frame.contentDocument?.documentElement.scrollHeight ?? 80;
-      frame.style.height = `${Math.max(height, 40)}px`;
-    };
-    // Each srcDoc load makes a fresh document, so the menu blocker is attached on every load.
-    const loaded = () => {
-      if (frame.contentDocument) blockPageMenu(frame.contentDocument);
-      fit();
-    };
-    frame.addEventListener("load", loaded);
-    fit();
-    return () => frame.removeEventListener("load", loaded);
-  }, [frame, html]);
+  // React's onLoad is bound before the frame enters the page, so a fast load in release builds can't slip past it.
+  // Each srcDoc load makes a fresh document, so the listeners are attached on every load.
+  const loaded = (event: SyntheticEvent<HTMLIFrameElement>) => {
+    const frame = event.currentTarget;
+    const doc = frame.contentDocument;
+    if (!doc) return;
+    blockPageMenu(doc);
+    doc.addEventListener("click", openLink);
+    doc.addEventListener("auxclick", openLink);
+    frame.style.height = `${Math.max(doc.documentElement.scrollHeight, 40)}px`;
+  };
   return (
     <iframe
-      ref={setFrame}
+      onLoad={loaded}
       title="Message"
       sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
       referrerPolicy="no-referrer"

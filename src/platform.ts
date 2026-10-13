@@ -20,13 +20,14 @@ export async function openExternal(url: string): Promise<void> {
 
 /**
  * Hides the webview's own right-click menu (Back, Reload, Print...) so the window feels like an app.
- * Text fields and selected text keep it for cut, copy and paste. Dev builds keep it for Inspect.
+ * Text fields and selected text keep it for cut, copy and paste, and links keep it for Copy link.
+ * Dev builds keep it for Inspect.
  */
 export function blockPageMenu(doc: Document): void {
   if (import.meta.env.DEV) return;
   doc.addEventListener("contextmenu", (event) => {
     const target = event.target as HTMLElement | null;
-    if (target?.closest("input, textarea, [contenteditable]:not([contenteditable='false'])")) return;
+    if (target?.closest("input, textarea, [contenteditable]:not([contenteditable='false']), a[href]")) return;
     if (doc.getSelection()?.toString().trim()) return;
     event.preventDefault();
   });
