@@ -387,6 +387,21 @@ pub fn delete_message(conn: &Connection, account_id: &str, message_id: &str) -> 
     Ok(())
 }
 
+/// Ids of the saved messages in Trash for one account, or for one conversation of it.
+pub fn trashed_message_ids(conn: &Connection, account_id: &str, thread_id: Option<&str>) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id FROM messages WHERE account_id = ?1 AND (?2 IS NULL OR thread_id = ?2) AND instr(label_ids, '\"TRASH\"') > 0",
+        )
+        .map_err(|e| e.to_string())?;
+    let ids = stmt
+        .query_map(params![account_id, thread_id], |row| row.get(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<String>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(ids)
+}
+
 pub fn draft_message_id(conn: &Connection, account_id: &str, draft_id: &str) -> Result<Option<String>, String> {
     match conn.query_row(
         "SELECT id FROM messages WHERE account_id = ?1 AND draft_id = ?2",

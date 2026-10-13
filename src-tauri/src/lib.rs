@@ -232,6 +232,8 @@ pub fn run() {
             commands::account_remove,
             commands::account_set_signature,
             commands::threads_modify,
+            commands::threads_delete_forever,
+            commands::trash_empty,
             commands::mail_send,
             commands::draft_save,
             commands::draft_delete,

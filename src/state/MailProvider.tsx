@@ -127,6 +127,10 @@ export type MailApi = {
   setCursor: (index: number) => void;
   act: (action: string, labelId?: string, targets?: ThreadTarget[]) => Promise<void>;
   undoAct: () => Promise<void>;
+  /** Deletes the trashed messages of the checked or open conversations for good. No undo. */
+  deleteForever: (targets?: ThreadTarget[]) => Promise<void>;
+  /** Deletes everything in Trash for good, for the selected account or all of them. No undo. */
+  emptyTrash: () => Promise<void>;
   saveSettings: (settings: Settings) => Promise<void>;
   setSignature: (accountId: string, signature: string) => Promise<void>;
   setSettingsOpen: (open: boolean) => void;
@@ -414,6 +418,49 @@ export function MailProvider({ children }: { children: ReactNode }) {
     try {
       if (current.reverse === "unsnooze") await unsnooze(current.targets);
       else await modify(current.targets, current.reverse, current.labelId, true);
+    } catch (error) {
+      toast(messageOf(error));
+    }
+  }
+
+  async function deleteForever(targets?: ThreadTarget[]) {
+    const list = targets && targets.length > 0 ? targets : currentTargets();
+    if (list.length === 0) return;
+    try {
+      if (modeRef.current === "demo" && demoRef.current) {
+        const db = demoRef.current;
+        db.messages = db.messages.filter(
+          (message) => !message.labelIds.includes("TRASH") || !list.some((target) => target.accountId === message.accountId && target.threadId === message.threadId),
+        );
+        publishDemo();
+      } else if (modeRef.current === "live") {
+        await api.threadsDeleteForever(list);
+        await reloadLive();
+      }
+      setChecked([]);
+      setUndo(null);
+      closeThread();
+      toast(list.length === 1 ? "Conversation deleted forever" : `${list.length} conversations deleted forever`);
+    } catch (error) {
+      toast(messageOf(error));
+    }
+  }
+
+  async function emptyTrash() {
+    const accountId = queryRef.current.accountId;
+    try {
+      if (modeRef.current === "demo" && demoRef.current) {
+        const db = demoRef.current;
+        db.messages = db.messages.filter((message) => !message.labelIds.includes("TRASH") || (accountId !== null && message.accountId !== accountId));
+        publishDemo();
+      } else if (modeRef.current === "live") {
+        await api.trashEmpty(accountId);
+        await reloadLive();
+      }
+      setChecked([]);
+      setUndo(null);
+      closeThread();
+      toast("Trash emptied");
     } catch (error) {
       toast(messageOf(error));
     }
@@ -1132,6 +1179,8 @@ export function MailProvider({ children }: { children: ReactNode }) {
     setCursor,
     act,
     undoAct,
+    deleteForever,
+    emptyTrash,
     saveSettings,
     setSignature,
     setSettingsOpen,

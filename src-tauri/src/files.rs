@@ -47,6 +47,10 @@ pub fn read_cached(
     .ok()
 }
 
+pub fn remove_message_files(data_dir: &Path, account_id: &str, message_id: &str) {
+    let _ = fs::remove_dir_all(account_dir(data_dir, account_id).join(safe_id(message_id)));
+}
+
 pub fn remove_account_files(data_dir: &Path, account_id: &str) {
     let _ = fs::remove_dir_all(account_dir(data_dir, account_id));
 }

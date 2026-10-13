@@ -211,6 +211,64 @@ pub async fn threads_modify(app: AppHandle, batch: ModifyBatch) -> Result<(), St
 }
 
 #[tauri::command]
+/// Deletes the trashed messages of these conversations for good. Messages of the same
+/// conversation that are not in Trash are kept, as in Gmail.
+pub async fn threads_delete_forever(app: AppHandle, targets: Vec<ThreadTarget>) -> Result<(), String> {
+    for target in &targets {
+        let ids = match gmail::trashed_message_ids(&app, &target.account_id, &target.thread_id).await {
+            // Already gone from Gmail; only the copy on this PC is left to clear.
+            Err(err) if err.starts_with("gmail_404:") => vec![],
+            result => result?,
+        };
+        gmail::delete_messages(&app, &target.account_id, &ids).await?;
+        let local = with_db(&app, |conn| {
+            db::trashed_message_ids(conn, &target.account_id, Some(&target.thread_id))
+        })?;
+        forget_messages(&app, &target.account_id, ids.iter().chain(&local))?;
+    }
+    crate::refresh_badge(&app);
+    let _ = app.emit("mail://updated", json!({}));
+    Ok(())
+}
+
+#[tauri::command]
+/// Deletes everything in Trash for good, for one account or for all of them.
+pub async fn trash_empty(app: AppHandle, account_id: Option<String>) -> Result<(), String> {
+    let accounts: Vec<String> = match account_id.filter(|id| !id.is_empty()) {
+        Some(id) => vec![id],
+        None => with_db(&app, db::list_accounts)?.into_iter().map(|account| account.id).collect(),
+    };
+    for id in accounts {
+        let mut ids = Vec::new();
+        let mut page: Option<String> = None;
+        loop {
+            let (batch, next) = gmail::list_label_ids(&app, &id, "TRASH", page.as_deref()).await?;
+            ids.extend(batch);
+            match next {
+                Some(token) => page = Some(token),
+                None => break,
+            }
+        }
+        gmail::delete_messages(&app, &id, &ids).await?;
+        let local = with_db(&app, |conn| db::trashed_message_ids(conn, &id, None))?;
+        forget_messages(&app, &id, ids.iter().chain(&local))?;
+    }
+    crate::refresh_badge(&app);
+    let _ = app.emit("mail://updated", json!({}));
+    Ok(())
+}
+
+/// Removes deleted messages and their saved attachments from this PC.
+fn forget_messages<'a>(app: &AppHandle, account_id: &str, ids: impl Iterator<Item = &'a String>) -> Result<(), String> {
+    let data_dir = app.state::<AppState>().data_dir.clone();
+    for id in ids {
+        with_db(app, |conn| db::delete_message(conn, account_id, id))?;
+        files::remove_message_files(&data_dir, account_id, id);
+    }
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn mail_send(app: AppHandle, request: ComposeRequest) -> Result<SendResult, String> {
     let (raw, thread_id) = prepare_raw(&app, &request)?;
     if let Some(draft_id) = request.draft_id.clone() {

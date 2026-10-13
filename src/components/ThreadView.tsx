@@ -5,6 +5,7 @@ import { blockPageMenu } from "../platform";
 import { cleanEmail } from "../sanitize";
 import { IconArchive, IconBack, IconStar, IconTrash } from "./Icons";
 import { WhenMenu } from "./WhenMenu";
+import { ConfirmDialog } from "./Dialogs";
 import { useMail } from "../state/MailProvider";
 import type { MessageDetail } from "../types";
 
@@ -14,9 +15,11 @@ export function ThreadView() {
   const snoozeArea = useRef<HTMLDivElement>(null);
   const closeSnooze = useCallback(() => setSnoozeOpen(false), []);
   useDismiss(snoozeArea, snoozeOpen, closeSnooze);
+  const [confirmDelete, setConfirmDelete] = useState(false);
   const thread = mail.thread;
   if (mail.threadLoading && !thread) return <div className="grid flex-1 place-items-center text-muted">Opening…</div>;
   if (!thread) return <div className="hidden flex-1 place-items-center text-muted lg:grid">Select a conversation</div>;
+  const inTrash = thread.messages.some((message) => message.labelIds.includes("TRASH"));
   const labels = mail.labels.filter((label) => label.accountId === thread.accountId && label.kind === "user" && thread.messages.some((message) => message.labelIds.includes(label.id)));
   return (
     <section className="flex min-w-0 flex-1 flex-col bg-panel">
@@ -33,7 +36,11 @@ export function ThreadView() {
         ) : (
           <>
             <button type="button" className="icon-btn" aria-label="Archive" onClick={() => void mail.act("archive")}><IconArchive /></button>
-            <button type="button" className="icon-btn" aria-label="Delete" onClick={() => void mail.act("trash")}><IconTrash /></button>
+            {inTrash ? (
+              <button type="button" className="tool-btn" onClick={() => setConfirmDelete(true)}>Delete forever</button>
+            ) : (
+              <button type="button" className="icon-btn" aria-label="Delete" onClick={() => void mail.act("trash")}><IconTrash /></button>
+            )}
             <button type="button" className="icon-btn" aria-label="Star" onClick={() => void mail.act(thread.messages.some((message) => message.starred) ? "unstar" : "star")}><IconStar filled={thread.messages.some((message) => message.starred)} /></button>
             <button type="button" className="tool-btn" onClick={() => void mail.act("unread")}>Unread</button>
             <div ref={snoozeArea} className="relative">
@@ -68,6 +75,15 @@ export function ThreadView() {
           ))}
         </div>
       </div>
+      {confirmDelete && (
+        <ConfirmDialog
+          title="Delete forever"
+          body="The messages of this conversation that are in Trash will be deleted from Gmail permanently. This can't be undone."
+          confirmLabel="Delete forever"
+          onConfirm={() => void mail.deleteForever([{ accountId: thread.accountId, threadId: thread.threadId }])}
+          onClose={() => setConfirmDelete(false)}
+        />
+      )}
     </section>
   );
 }

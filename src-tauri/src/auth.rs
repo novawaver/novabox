@@ -92,7 +92,8 @@ pub fn browser_sign_in(client_id: &str, cancel: &AtomicBool) -> Result<OauthCode
             .append_pair("response_type", "code")
             .append_pair(
                 "scope",
-                "openid email profile https://www.googleapis.com/auth/gmail.modify",
+                // gmail.modify cannot delete mail for good; Delete forever and Empty Trash need https://mail.google.com/.
+                "openid email profile https://www.googleapis.com/auth/gmail.modify https://mail.google.com/",
             )
             .append_pair("code_challenge", &challenge)
             .append_pair("code_challenge_method", "S256")

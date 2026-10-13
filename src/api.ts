@@ -62,6 +62,8 @@ export const api = {
     invoke<void>("account_set_signature", { update: { accountId, signature } }),
   threadsModify: (targets: ThreadTarget[], action: string, labelId?: string) =>
     invoke<void>("threads_modify", { batch: { targets, action, labelId: labelId ?? null } }),
+  threadsDeleteForever: (targets: ThreadTarget[]) => invoke<void>("threads_delete_forever", { targets }),
+  trashEmpty: (accountId: string | null) => invoke<void>("trash_empty", { accountId }),
   mailSend: (draft: ComposeDraft) => invoke<SendResult>("mail_send", { request: composePayload(draft) }),
   draftSave: (draft: ComposeDraft) => invoke<SendResult>("draft_save", { request: composePayload(draft) }),
   draftDelete: (accountId: string, draftId: string) => invoke<void>("draft_delete", { accountId, draftId }),

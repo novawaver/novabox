@@ -1,6 +1,7 @@
 import { formatListDate, personName, threadKey } from "../format";
 import { IconArchive, IconBack, IconNext, IconPaperclip, IconRefresh, IconStar, IconTrash } from "./Icons";
 import { WhenMenu } from "./WhenMenu";
+import { ConfirmDialog } from "./Dialogs";
 import { useMail } from "../state/MailProvider";
 import { defaultInboxTabs, type Category, type InboxTabs } from "../types";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -44,6 +45,10 @@ export function MessageList({ className = "" }: { className?: string }) {
   const accountIds = new Set(mail.checked.map((key) => key.split("\t")[0]));
   const labelAccount = accountIds.size === 1 ? [...accountIds][0] : mail.query.accountId;
   const labelChoices = mail.labels.filter((label) => label.kind === "user" && (!labelAccount || label.accountId === labelAccount));
+  const inTrash = mail.query.folder === "trash";
+  const [confirm, setConfirm] = useState<"delete" | "empty" | null>(null);
+  const deleteCount = mail.checked.length > 0 ? mail.checked.length : 1;
+  const trashOwner = mail.accounts.find((account) => account.id === mail.query.accountId)?.email;
   const pageStart = mail.threads.length > 0 ? mail.query.offset + 1 : 0;
   const pageEnd = mail.query.offset + mail.threads.length;
   return (
@@ -73,7 +78,14 @@ export function MessageList({ className = "" }: { className?: string }) {
         />
         <button type="button" className="icon-btn" aria-label="Refresh" onClick={() => void mail.refresh()}><IconRefresh /></button>
         <button type="button" className="icon-btn" aria-label="Archive" title="Archive" disabled={!hasTargets} onClick={() => void mail.act("archive")}><IconArchive /></button>
-        <button type="button" className="icon-btn" aria-label="Delete" title="Delete" disabled={!hasTargets} onClick={() => void mail.act("trash")}><IconTrash /></button>
+        {inTrash ? (
+          <>
+            <button type="button" className="tool-btn" disabled={!hasTargets} onClick={() => setConfirm("delete")}>Delete forever</button>
+            <button type="button" className="tool-btn" disabled={mail.total === 0} onClick={() => setConfirm("empty")}>Empty Trash</button>
+          </>
+        ) : (
+          <button type="button" className="icon-btn" aria-label="Delete" title="Delete" disabled={!hasTargets} onClick={() => void mail.act("trash")}><IconTrash /></button>
+        )}
         <button type="button" className="tool-btn" aria-label="Mark read" disabled={!hasTargets} onClick={() => void mail.act("read")}>Read</button>
         <button type="button" className="tool-btn" aria-label="Report spam" disabled={!hasTargets} onClick={() => void mail.act("spam")}>Spam</button>
         {mail.query.folder === "snoozed" ? (
@@ -184,6 +196,24 @@ export function MessageList({ className = "" }: { className?: string }) {
           );
         })}
       </div>
+      {confirm === "delete" && (
+        <ConfirmDialog
+          title="Delete forever"
+          body={`${deleteCount === 1 ? "This conversation" : `These ${deleteCount} conversations`} will be deleted from Gmail permanently. This can't be undone.`}
+          confirmLabel="Delete forever"
+          onConfirm={() => void mail.deleteForever()}
+          onClose={() => setConfirm(null)}
+        />
+      )}
+      {confirm === "empty" && (
+        <ConfirmDialog
+          title="Empty Trash"
+          body={`Everything in Trash${trashOwner ? ` for ${trashOwner}` : " for all your accounts"} will be deleted from Gmail permanently. This can't be undone.`}
+          confirmLabel="Empty Trash"
+          onConfirm={() => void mail.emptyTrash()}
+          onClose={() => setConfirm(null)}
+        />
+      )}
     </section>
   );
 }

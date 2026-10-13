@@ -195,6 +195,28 @@ export function SettingsDialog() {
 
 const openOverlays: symbol[] = [];
 
+/** A yes/no question for actions that cannot be undone. */
+export function ConfirmDialog({ title, body, confirmLabel, onConfirm, onClose }: { title: string; body: string; confirmLabel: string; onConfirm: () => void; onClose: () => void }) {
+  return (
+    <Overlay title={title} onClose={onClose}>
+      <p className="text-sm text-muted">{body}</p>
+      <div className="mt-5 flex justify-end gap-2">
+        <button type="button" autoFocus className="rounded-full px-4 py-2" onClick={onClose}>Cancel</button>
+        <button
+          type="button"
+          className="rounded-full bg-danger px-4 py-2 font-semibold text-white"
+          onClick={() => {
+            onClose();
+            onConfirm();
+          }}
+        >
+          {confirmLabel}
+        </button>
+      </div>
+    </Overlay>
+  );
+}
+
 export function Overlay({ title, onClose, children, wide = false }: { title: string; onClose: () => void; children: ReactNode; wide?: boolean }) {
   // Escape closes the dialog, as with any modal; only the topmost one when they stack.
   const [layer] = useState(() => Symbol("overlay"));
