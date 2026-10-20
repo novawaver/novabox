@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 use futures_util::future::join_all;
 use serde_json::{json, Value};
@@ -24,9 +25,8 @@ pub async fn sync_all(app: &AppHandle) -> Result<(), String> {
                 .map(|account| account.id)
                 .collect::<Vec<_>>()
         };
-        for id in ids {
-            let _ = sync_account(app, &id, false).await;
-        }
+        // Accounts sync side by side so one account's backfill never holds up another's new mail.
+        join_all(ids.iter().map(|id| sync_account(app, id, false))).await;
         Ok(())
     }
     .await;
@@ -34,6 +34,52 @@ pub async fn sync_all(app: &AppHandle) -> Result<(), String> {
         .sync_all_running
         .store(false, std::sync::atomic::Ordering::SeqCst);
     result
+}
+
+/// Cheap new-mail check: only the Gmail history call, with no labels, backfill or spam/trash.
+/// Runs often; accounts already mid-sync are skipped since that sync reads history itself.
+pub async fn check_new_mail(app: &AppHandle) {
+    let accounts = {
+        let state = app.state::<AppState>();
+        let Ok(db) = state.db.lock() else { return };
+        db::list_accounts(&db).unwrap_or_default()
+    };
+    let checks = accounts
+        .into_iter()
+        .filter(|account| account.initial_done)
+        .map(|account| async move {
+            if !begin(app, &account.id).unwrap_or(false) {
+                return None;
+            }
+            let started = Instant::now();
+            let result = history_sync(app, &account).await;
+            let elapsed = started.elapsed().as_millis() as u64;
+            end(app, &account.id);
+            if let Ok(true) = result {
+                let _ = app.emit("mail://updated", json!({}));
+                let _ = app.emit(
+                    "sync://done",
+                    json!({ "accountId": account.id, "ok": true, "message": "", "offline": false }),
+                );
+                crate::refresh_badge(app);
+            }
+            // With no changes the check was a single history call, so its time is the round trip to Gmail.
+            Some(result.map(|changed| (!changed).then_some(elapsed)))
+        });
+    let probes: Vec<_> = join_all(checks).await.into_iter().flatten().collect();
+    if probes.is_empty() {
+        return;
+    }
+    let reached: Vec<Option<u64>> = probes.iter().filter_map(|probe| probe.as_ref().ok().copied()).collect();
+    let status = if !reached.is_empty() {
+        let latency = reached.into_iter().flatten().max();
+        json!({ "state": "online", "latencyMs": latency, "message": "" })
+    } else {
+        let err = probes.iter().find_map(|probe| probe.as_ref().err()).cloned().unwrap_or_default();
+        let state = if is_offline(&err) { "offline" } else { "error" };
+        json!({ "state": state, "latencyMs": null, "message": err })
+    };
+    let _ = app.emit("net://status", status);
 }
 
 pub async fn sync_account(app: &AppHandle, account_id: &str, eager: bool) -> Result<(), String> {
@@ -47,14 +93,14 @@ pub async fn sync_account(app: &AppHandle, account_id: &str, eager: bool) -> Res
             let _ = app.emit("mail://updated", json!({}));
             let _ = app.emit(
                 "sync://done",
-                json!({ "ok": true, "message": "", "offline": false }),
+                json!({ "accountId": account_id, "ok": true, "message": "", "offline": false }),
             );
             crate::refresh_badge(app);
         }
         Err(err) => {
             let _ = app.emit(
                 "sync://done",
-                json!({ "ok": false, "message": err, "offline": is_offline(err) }),
+                json!({ "accountId": account_id, "ok": false, "message": err, "offline": is_offline(err) }),
             );
         }
     }
@@ -64,6 +110,11 @@ pub async fn sync_account(app: &AppHandle, account_id: &str, eager: bool) -> Res
 async fn sync_inner(app: &AppHandle, account_id: &str, eager: bool) -> Result<(), String> {
     let mut account = with_db(app, |conn| db::get_account(conn, account_id))?;
     emit(app, &account.email, "Checking for new mail", 0);
+    // New mail first, so its notification does not wait on the slower steps below.
+    if account.initial_done {
+        history_sync(app, &account).await?;
+        account = with_db(app, |conn| db::get_account(conn, account_id))?;
+    }
     if let Ok(labels) = gmail::labels(app, account_id).await {
         with_db(app, |conn| db::replace_labels(conn, account_id, &labels))?;
     }
@@ -73,8 +124,6 @@ async fn sync_inner(app: &AppHandle, account_id: &str, eager: bool) -> Result<()
     if !account.initial_done {
         sync_recent(app, &mut account, if eager { 4 } else { 1 }).await?;
     } else {
-        history_sync(app, &account).await?;
-        account = with_db(app, |conn| db::get_account(conn, account_id))?;
         backfill_page(app, &mut account).await?;
     }
     if account.initial_done {
@@ -112,9 +161,11 @@ async fn sync_recent(app: &AppHandle, account: &mut Account, max_pages: usize) -
     }
     let mut token = account.recent_page_token.clone();
     for _ in 0..max_pages {
-        emit(app, &account.email, "Downloading recent mail", 0);
+        // Progress counts every message stored so far, so the setup screen shows a running total.
+        let stored = with_db(app, |conn| db::message_count(conn, &account.id))? as u32;
+        emit(app, &account.email, "Downloading recent mail", stored);
         let (ids, next) = gmail::list_message_ids(app, &account.id, "newer_than:90d", token.as_deref()).await?;
-        fetch_store(app, &account.id, &account.email, "Downloading recent mail", &ids).await?;
+        fetch_store(app, &account.id, &account.email, "Downloading recent mail", stored, &ids).await?;
         if let Some(next) = next {
             account.recent_page_token = Some(next.clone());
             token = Some(next);
@@ -124,6 +175,7 @@ async fn sync_recent(app: &AppHandle, account: &mut Account, max_pages: usize) -
             account.initial_done = true;
             save_account(app, account)?;
             history_sync(app, account).await?;
+            *account = with_db(app, |conn| db::get_account(conn, &account.id))?;
             backfill_page(app, account).await?;
             break;
         }
@@ -137,7 +189,7 @@ async fn backfill_page(app: &AppHandle, account: &mut Account) -> Result<(), Str
     }
     emit(app, &account.email, "Downloading older mail", 0);
     let (ids, next) = gmail::list_message_ids(app, &account.id, "older_than:90d", account.backfill_token.as_deref()).await?;
-    fetch_store(app, &account.id, &account.email, "Downloading older mail", &ids).await?;
+    fetch_store(app, &account.id, &account.email, "Downloading older mail", 0, &ids).await?;
     match next {
         Some(next) => account.backfill_token = Some(next),
         None => {
@@ -165,7 +217,7 @@ async fn sync_hidden_label(app: &AppHandle, account: &Account, label: &str) -> R
             break;
         }
         emit(app, &account.email, phase, 0);
-        fetch_store(app, &account.id, &account.email, phase, &missing).await?;
+        fetch_store(app, &account.id, &account.email, phase, 0, &missing).await?;
         match next {
             Some(next) => token = Some(next),
             None => break,
@@ -174,9 +226,10 @@ async fn sync_hidden_label(app: &AppHandle, account: &Account, label: &str) -> R
     Ok(())
 }
 
-async fn history_sync(app: &AppHandle, account: &Account) -> Result<(), String> {
+/// Returns whether anything in the mailbox changed.
+async fn history_sync(app: &AppHandle, account: &Account) -> Result<bool, String> {
     let Some(start) = account.history_id.clone() else {
-        return Ok(());
+        return Ok(false);
     };
     let mut page: Option<String> = None;
     let mut latest = start.clone();
@@ -191,7 +244,7 @@ async fn history_sync(app: &AppHandle, account: &Account) -> Result<(), String> 
                 reset.initial_done = false;
                 reset.recent_page_token = None;
                 save_account(app, &reset)?;
-                return Ok(());
+                return Ok(false);
             }
             Err(err) => return Err(err),
         };
@@ -212,9 +265,11 @@ async fn history_sync(app: &AppHandle, account: &Account) -> Result<(), String> 
         }
         break;
     }
+    let data_dir = app.state::<AppState>().data_dir.clone();
     for id in &to_delete {
         to_fetch.remove(id);
         with_db(app, |conn| db::delete_message(conn, &account.id, id))?;
+        files::remove_message_files(&data_dir, &account.id, id);
     }
     let fetch_list: Vec<String> = to_fetch.into_iter().take(200).collect();
     let mut fresh = Vec::new();
@@ -225,8 +280,9 @@ async fn history_sync(app: &AppHandle, account: &Account) -> Result<(), String> 
     }
     if !fetch_list.is_empty() {
         emit(app, &account.email, "Updating inbox", 0);
-        fetch_store(app, &account.id, &account.email, "Updating inbox", &fetch_list).await?;
+        fetch_store(app, &account.id, &account.email, "Updating inbox", 0, &fetch_list).await?;
     }
+    let changed = !to_delete.is_empty() || !fetch_list.is_empty();
     let mut updated = account.clone();
     updated.history_id = Some(latest);
     save_account(app, &updated)?;
@@ -267,7 +323,7 @@ async fn history_sync(app: &AppHandle, account: &Account) -> Result<(), String> 
             }),
         );
     }
-    Ok(())
+    Ok(changed)
 }
 
 fn lookup_or_empty(conn: &rusqlite::Connection, account_id: &str, message_id: &str) -> Result<String, String> {
@@ -297,10 +353,14 @@ async fn fetch_store(
     account_id: &str,
     email: &str,
     phase: &str,
+    base: u32,
     ids: &[String],
 ) -> Result<(), String> {
     let mut fetched = 0u32;
     let mut first_error: Option<String> = None;
+    // Every refresh makes the window re-query the mailbox, so refresh at most every few seconds.
+    let mut last_refresh = Instant::now();
+    let mut stale = false;
     for chunk in ids.chunks(4) {
         let futures = chunk.iter().cloned().map(|id| {
             let app = app.clone();
@@ -327,10 +387,16 @@ async fn fetch_store(
                 }
             }
         }
-        emit(app, email, phase, fetched);
-        if fetched > 0 {
+        emit(app, email, phase, base + fetched);
+        stale |= fetched > 0;
+        if stale && last_refresh.elapsed() >= Duration::from_secs(3) {
             let _ = app.emit("mail://updated", json!({}));
+            last_refresh = Instant::now();
+            stale = false;
         }
+    }
+    if stale {
+        let _ = app.emit("mail://updated", json!({}));
     }
     if fetched == 0 {
         if let Some(err) = first_error {

@@ -116,3 +116,22 @@ export function IconLink({ className = "h-4 w-4" }: IconProps) {
 export function IconClearFormat({ className = "h-4 w-4" }: IconProps) {
   return <svg viewBox="0 0 24 24" className={className} {...stroke}><path d="M4 7V4h16v3" /><path d="M5 20h6" /><path d="M13 4 8 20" /><path d="m15 15 5 5M20 15l-5 5" /></svg>;
 }
+/** Signal-strength bars; `level` 0–3 is how many are filled, `off` strikes them through. */
+export function IconSignal({ level, off = false, className = "h-[18px] w-[18px]" }: IconProps & { level: number; off?: boolean }) {
+  const bars = [
+    { x: 4, y: 15, h: 5 },
+    { x: 10.5, y: 10, h: 10 },
+    { x: 17, y: 4, h: 16 },
+  ];
+  return (
+    <svg viewBox="0 0 24 24" className={className} aria-hidden="true">
+      {bars.map((bar, index) => (
+        <rect key={bar.x} x={bar.x} y={bar.y} width="4" height={bar.h} rx="1" fill="currentColor" opacity={index < level ? 1 : 0.25} />
+      ))}
+      {off && <path d="m3 3 18 18" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />}
+    </svg>
+  );
+}
+export function IconCaret({ className = "h-3.5 w-3.5" }: IconProps) {
+  return <svg viewBox="0 0 24 24" className={className} {...stroke} strokeWidth={2.5}><path d="m6 9 6 6 6-6" /></svg>;
+}

@@ -1,13 +1,13 @@
 import { formatListDate, personName, threadKey } from "../format";
 import { IconArchive, IconBack, IconNext, IconPaperclip, IconRefresh, IconStar, IconTrash } from "./Icons";
 import { WhenMenu } from "./WhenMenu";
-import { ConfirmDialog } from "./Dialogs";
 import { useMail } from "../state/MailProvider";
 import { defaultInboxTabs, type Category, type InboxTabs } from "../types";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useDismiss } from "../useDismiss";
 
 const TABS: { id: Category; label: string }[] = [
+  { id: "all", label: "All" },
   { id: "primary", label: "Primary" },
   { id: "promotions", label: "Promotions" },
   { id: "social", label: "Social" },
@@ -30,13 +30,15 @@ export function MessageList({ className = "" }: { className?: string }) {
     document.querySelector(`[data-row="${mail.cursor}"]`)?.scrollIntoView({ block: "nearest" });
   }, [mail.cursor]);
   const inboxTabs = mail.settings.inboxTabs ?? defaultInboxTabs;
-  const tabs = TABS.filter((tab) => tab.id === "primary" || inboxTabs[tab.id as keyof InboxTabs]);
+  const tabs = TABS.filter((tab) => tab.id === "all" || tab.id === "primary" || inboxTabs[tab.id as keyof InboxTabs]);
   useEffect(() => {
-    if (mail.query.folder === "inbox" && mail.query.category !== "primary" && !inboxTabs[mail.query.category]) {
+    const category = mail.query.category;
+    if (mail.query.folder === "inbox" && category !== "all" && category !== "primary" && !inboxTabs[category]) {
       mail.setCategory("primary");
     }
   }, [mail.query.folder, mail.query.category, inboxTabs, mail.setCategory]);
   const counts: Record<Category, number> = {
+    all: mail.counts.inboxUnread,
     primary: mail.counts.primaryUnread,
     promotions: mail.counts.promotionsUnread,
     social: mail.counts.socialUnread,
@@ -46,9 +48,6 @@ export function MessageList({ className = "" }: { className?: string }) {
   const labelAccount = accountIds.size === 1 ? [...accountIds][0] : mail.query.accountId;
   const labelChoices = mail.labels.filter((label) => label.kind === "user" && (!labelAccount || label.accountId === labelAccount));
   const inTrash = mail.query.folder === "trash";
-  const [confirm, setConfirm] = useState<"delete" | "empty" | null>(null);
-  const deleteCount = mail.checked.length > 0 ? mail.checked.length : 1;
-  const trashOwner = mail.accounts.find((account) => account.id === mail.query.accountId)?.email;
   const pageStart = mail.threads.length > 0 ? mail.query.offset + 1 : 0;
   const pageEnd = mail.query.offset + mail.threads.length;
   return (
@@ -79,12 +78,9 @@ export function MessageList({ className = "" }: { className?: string }) {
         <button type="button" className="icon-btn" aria-label="Refresh" onClick={() => void mail.refresh()}><IconRefresh /></button>
         <button type="button" className="icon-btn" aria-label="Archive" title="Archive" disabled={!hasTargets} onClick={() => void mail.act("archive")}><IconArchive /></button>
         {inTrash ? (
-          <>
-            <button type="button" className="tool-btn" disabled={!hasTargets} onClick={() => setConfirm("delete")}>Delete forever</button>
-            <button type="button" className="tool-btn" disabled={mail.total === 0} onClick={() => setConfirm("empty")}>Empty Trash</button>
-          </>
+          <button type="button" className="tool-btn" title="Move back to the inbox" disabled={!hasTargets} onClick={() => void mail.act("untrash")}>Restore</button>
         ) : (
-          <button type="button" className="icon-btn" aria-label="Delete" title="Delete" disabled={!hasTargets} onClick={() => void mail.act("trash")}><IconTrash /></button>
+          <button type="button" className="icon-btn" aria-label="Delete" title="Move to Trash" disabled={!hasTargets} onClick={() => void mail.act("trash")}><IconTrash /></button>
         )}
         <button type="button" className="tool-btn" aria-label="Mark read" disabled={!hasTargets} onClick={() => void mail.act("read")}>Read</button>
         <button type="button" className="tool-btn" aria-label="Report spam" disabled={!hasTargets} onClick={() => void mail.act("spam")}>Spam</button>
@@ -128,8 +124,19 @@ export function MessageList({ className = "" }: { className?: string }) {
           </div>
         )}
       </div>
+      {inTrash && (
+        <p className="border-b border-line px-4 py-2 text-xs text-muted">Gmail deletes conversations in Trash for good after 30 days.</p>
+      )}
       <div className="min-h-0 flex-1 overflow-y-auto">
-        {mail.threads.length === 0 && (
+        {mail.listLoading && (
+          <div className="grid h-full place-items-center text-muted" role="status" aria-live="polite">
+            <div className="flex flex-col items-center gap-3">
+              <span className="h-8 w-8 animate-spin rounded-full border-2 border-line border-t-accent" aria-hidden />
+              <span className="text-sm">Loading…</span>
+            </div>
+          </div>
+        )}
+        {!mail.listLoading && mail.threads.length === 0 && (
           <div className="grid h-full place-items-center px-6 text-center text-muted">
             <div>
               <p className="text-lg text-ink">Nothing in here</p>
@@ -137,7 +144,7 @@ export function MessageList({ className = "" }: { className?: string }) {
             </div>
           </div>
         )}
-        {mail.threads.map((thread, index) => {
+        {!mail.listLoading && mail.threads.map((thread, index) => {
           const key = threadKey(thread.accountId, thread.threadId);
           const active = (mail.thread?.accountId === thread.accountId && mail.thread.threadId === thread.threadId);
           return (
@@ -147,7 +154,7 @@ export function MessageList({ className = "" }: { className?: string }) {
               role="button"
               tabIndex={0}
               aria-label={thread.subject || "(no subject)"}
-              className={`mail-row grid cursor-pointer grid-cols-[28px_28px_minmax(120px,180px)_1fr_auto] items-center gap-2 border-b border-line px-2 ${active ? "bg-selected" : "hover:bg-hover"} ${thread.unread ? "font-semibold" : ""}`}
+              className={`mail-row grid cursor-pointer grid-cols-[28px_28px_minmax(120px,180px)_1fr_auto] items-center gap-2 border-b border-line px-2 ${active ? "bg-selected" : thread.unread ? "hover:bg-hover" : "bg-read hover:bg-hover"} ${thread.unread ? "font-semibold" : ""}`}
               style={{ boxShadow: mail.query.accountId ? undefined : `inset 3px 0 0 ${thread.accountColor}` }}
               onClick={() => void mail.openThread(thread)}
               onKeyDown={(event) => {
@@ -177,7 +184,7 @@ export function MessageList({ className = "" }: { className?: string }) {
               </button>
               <div className="min-w-0 leading-tight">
                 <div className="truncate">{personName(thread.fromName, thread.fromEmail)}{thread.messageCount > 1 ? ` (${thread.messageCount})` : ""}</div>
-                {thread.fromName.trim() && thread.fromEmail && <div className="truncate text-xs font-normal text-muted">{thread.fromEmail}</div>}
+                {thread.fromName.trim() && thread.fromEmail && <div className="truncate text-xs font-normal text-muted opacity-70">{thread.fromEmail}</div>}
               </div>
               <div className="min-w-0 truncate">
                 <span>{thread.subject || "(no subject)"}</span>
@@ -196,24 +203,6 @@ export function MessageList({ className = "" }: { className?: string }) {
           );
         })}
       </div>
-      {confirm === "delete" && (
-        <ConfirmDialog
-          title="Delete forever"
-          body={`${deleteCount === 1 ? "This conversation" : `These ${deleteCount} conversations`} will be deleted from Gmail permanently. This can't be undone.`}
-          confirmLabel="Delete forever"
-          onConfirm={() => void mail.deleteForever()}
-          onClose={() => setConfirm(null)}
-        />
-      )}
-      {confirm === "empty" && (
-        <ConfirmDialog
-          title="Empty Trash"
-          body={`Everything in Trash${trashOwner ? ` for ${trashOwner}` : " for all your accounts"} will be deleted from Gmail permanently. This can't be undone.`}
-          confirmLabel="Empty Trash"
-          onConfirm={() => void mail.emptyTrash()}
-          onClose={() => setConfirm(null)}
-        />
-      )}
     </section>
   );
 }

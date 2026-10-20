@@ -387,21 +387,6 @@ pub fn delete_message(conn: &Connection, account_id: &str, message_id: &str) -> 
     Ok(())
 }
 
-/// Ids of the saved messages in Trash for one account, or for one conversation of it.
-pub fn trashed_message_ids(conn: &Connection, account_id: &str, thread_id: Option<&str>) -> Result<Vec<String>, String> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT id FROM messages WHERE account_id = ?1 AND (?2 IS NULL OR thread_id = ?2) AND instr(label_ids, '\"TRASH\"') > 0",
-        )
-        .map_err(|e| e.to_string())?;
-    let ids = stmt
-        .query_map(params![account_id, thread_id], |row| row.get(0))
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<String>, _>>()
-        .map_err(|e| e.to_string())?;
-    Ok(ids)
-}
-
 pub fn draft_message_id(conn: &Connection, account_id: &str, draft_id: &str) -> Result<Option<String>, String> {
     match conn.query_row(
         "SELECT id FROM messages WHERE account_id = ?1 AND draft_id = ?2",
@@ -426,6 +411,30 @@ pub fn delete_draft(conn: &Connection, account_id: &str, draft_id: &str) -> Resu
     drop(stmt);
     for id in ids {
         delete_message(conn, account_id, &id)?;
+    }
+    Ok(())
+}
+
+/// Each message of a conversation with its labels, so a change can be rolled back.
+pub fn thread_labels(conn: &Connection, account_id: &str, thread_id: &str) -> Result<Vec<(String, Vec<String>)>, String> {
+    let mut stmt = conn
+        .prepare("SELECT id, label_ids FROM messages WHERE account_id = ?1 AND thread_id = ?2")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![account_id, thread_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows.into_iter().map(|(id, json)| (id, json_vec(&json))).collect())
+}
+
+pub fn restore_labels(conn: &Connection, account_id: &str, saved: &[(String, Vec<String>)]) -> Result<(), String> {
+    for (id, labels) in saved {
+        conn.execute(
+            "UPDATE messages SET label_ids = ?1 WHERE account_id = ?2 AND id = ?3",
+            params![to_json(labels), account_id, id],
+        )
+        .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -1147,6 +1156,7 @@ fn message_in_folder(labels: &[String], folder: &str, label_id: Option<&str>, ca
             let social = tabs.social && (has_label(labels, "CATEGORY_SOCIAL") || has_label(labels, "CATEGORY_FORUMS"));
             let updates = tabs.updates && has_label(labels, "CATEGORY_UPDATES");
             match category.unwrap_or("primary") {
+                "all" => true,
                 "promotions" => promotions,
                 "social" => social,
                 "updates" => updates,

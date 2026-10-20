@@ -16,6 +16,7 @@ mod gmail;
 mod later;
 mod mime_build;
 mod model;
+mod outbox;
 mod parse;
 mod popup;
 mod secrets;
@@ -173,6 +174,8 @@ pub fn run() {
                 due_running: AtomicBool::new(false),
                 sign_in_cancel: Arc::new(AtomicBool::new(false)),
             });
+            let outbox = outbox::start(app.handle());
+            app.manage(outbox);
             if setup_tray(app) {
                 app.state::<AppState>()
                     .close_to_tray
@@ -186,18 +189,22 @@ pub fn run() {
                     let _ = sync::sync_all(&startup).await;
                 });
                 std::thread::sleep(Duration::from_secs(6));
+                // Every 10s: a cheap history check for new mail. Every 2 min: the full sync
+                // (labels, older mail, spam/trash, drafts).
                 let mut ticks = 0u32;
                 loop {
                     ticks += 1;
                     let handle = handle.clone();
-                    let sync_due = ticks % 3 == 0;
+                    let full_sync_due = ticks % 12 == 0;
                     tauri::async_runtime::spawn(async move {
                         let _ = later::release_due(&handle).await;
-                        if sync_due {
+                        if full_sync_due {
                             let _ = sync::sync_all(&handle).await;
+                        } else {
+                            sync::check_new_mail(&handle).await;
                         }
                     });
-                    std::thread::sleep(Duration::from_secs(15));
+                    std::thread::sleep(Duration::from_secs(10));
                 }
             });
             Ok(())
@@ -232,13 +239,12 @@ pub fn run() {
             commands::account_remove,
             commands::account_set_signature,
             commands::threads_modify,
-            commands::threads_delete_forever,
-            commands::trash_empty,
             commands::mail_send,
             commands::draft_save,
             commands::draft_delete,
             commands::remote_search,
             commands::sync_now,
+            commands::check_connection,
             commands::attachment_get,
             commands::attachment_save,
             commands::threads_snooze,

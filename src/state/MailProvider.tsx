@@ -70,9 +70,22 @@ const ACTION_TEXT: Record<string, string> = {
   "remove-label": "Label removed",
 };
 
+/** Shown over the open conversation while an action moves it out of the current folder. */
+const LEAVING_TEXT: Record<string, string> = {
+  archive: "Archiving…",
+  trash: "Deleting…",
+  spam: "Moving to spam…",
+  snooze: "Snoozing…",
+};
+
 type Undo = { text: string; targets: ThreadTarget[]; reverse: string; labelId?: string };
 type Toast = { id: string; text: string };
 type Mode = "none" | "demo" | "live";
+/** A newly signed-in account whose first batch of mail is still downloading. */
+export type Setup = { accountId: string; email: string; fetched: number; error: string };
+/** How the last check of Gmail went. `latencyMs` is the round trip of a history call, when one was timed. */
+export type Connection = { state: "checking" | "online" | "offline" | "error"; latencyMs: number | null; message: string };
+type SyncDone = { accountId?: string; ok: boolean; message: string; offline: boolean };
 
 export type MailApi = {
   ready: boolean;
@@ -87,6 +100,10 @@ export type MailApi = {
   query: MailQuery;
   thread: ThreadDetail | null;
   threadLoading: boolean;
+  /** Set from a tab, folder or account switch until that list arrives; the list shows a spinner. */
+  listLoading: boolean;
+  /** Set while an action moves the open conversation away; the reading pane shows it instead of the mail. */
+  threadBusy: string;
   checked: string[];
   cursor: number;
   settings: Settings;
@@ -99,8 +116,13 @@ export type MailApi = {
   syncing: boolean;
   syncLabel: string;
   offline: boolean;
+  connection: Connection;
   signInBusy: boolean;
   signInError: string;
+  /** Set while a new account's first mail downloads; the window shows a setup screen instead of the inbox. */
+  setup: Setup | null;
+  retrySetup: () => void;
+  skipSetup: () => void;
   /** Whether this build can sign in to Google (a client ID was set in .env at build time). */
   googleReady: boolean;
   shownImages: string[];
@@ -128,9 +150,6 @@ export type MailApi = {
   act: (action: string, labelId?: string, targets?: ThreadTarget[]) => Promise<void>;
   undoAct: () => Promise<void>;
   /** Deletes the trashed messages of the checked or open conversations for good. No undo. */
-  deleteForever: (targets?: ThreadTarget[]) => Promise<void>;
-  /** Deletes everything in Trash for good, for the selected account or all of them. No undo. */
-  emptyTrash: () => Promise<void>;
   saveSettings: (settings: Settings) => Promise<void>;
   setSignature: (accountId: string, signature: string) => Promise<void>;
   setSettingsOpen: (open: boolean) => void;
@@ -175,6 +194,11 @@ export function MailProvider({ children }: { children: ReactNode }) {
   const [query, setQuery] = useState<MailQuery>(initialQuery);
   const [thread, setThread] = useState<ThreadDetail | null>(null);
   const [threadLoading, setThreadLoading] = useState(false);
+  const [listLoading, setListLoading] = useState(false);
+  // Counts mailbox loads; only the newest may update the list, so quick tab clicks can't land out of order.
+  const loadSeqRef = useRef(0);
+  const shownQueryRef = useRef<MailQuery | null>(null);
+  const [threadBusy, setThreadBusy] = useState("");
   const [checked, setChecked] = useState<string[]>([]);
   const [cursor, setCursor] = useState(0);
   const [settings, setSettings] = useState<Settings>(defaultSettings);
@@ -187,8 +211,10 @@ export function MailProvider({ children }: { children: ReactNode }) {
   const [syncing, setSyncing] = useState(false);
   const [syncLabel, setSyncLabel] = useState("");
   const [offline, setOffline] = useState(false);
+  const [connection, setConnection] = useState<Connection>({ state: "checking", latencyMs: null, message: "" });
   const [signInBusy, setSignInBusy] = useState(false);
   const [signInError, setSignInError] = useState("");
+  const [setup, setSetupState] = useState<Setup | null>(null);
   const [googleReady, setGoogleReady] = useState(true);
   const [shownImages, setShownImages] = useState<string[]>([]);
   const [remoteThreads, setRemoteThreads] = useState<ThreadSummary[] | null>(null);
@@ -206,6 +232,9 @@ export function MailProvider({ children }: { children: ReactNode }) {
   const accountsRef = useRef<Account[]>([]);
   const composesRef = useRef(composes);
   const reloadRef = useRef<() => Promise<void>>(async () => {});
+  const setupRef = useRef<Setup | null>(null);
+  // The first sync can finish before sign_in returns, so remember how each account's last sync ended.
+  const syncResultsRef = useRef(new Map<string, SyncDone>());
   const toastRef = useRef<(text: string) => void>(() => {});
   const deliverRef = useRef<(payload: Omit<Notice, "id">, prefs: Settings, test?: boolean) => void>(() => {});
   const openNoticeRef = useRef<(notice: Notice) => void>(() => {});
@@ -237,8 +266,13 @@ export function MailProvider({ children }: { children: ReactNode }) {
   }
 
   async function reloadLive() {
-    const next = await api.mailbox(queryRef.current, settingsRef.current.inboxTabs);
+    const seq = ++loadSeqRef.current;
+    const asked = queryRef.current;
+    const next = await api.mailbox(asked, settingsRef.current.inboxTabs);
+    // A newer load is on its way and will fill in the rest.
+    if (seq !== loadSeqRef.current) return;
     setBox(next);
+    if (asked === queryRef.current) setListLoading(false);
     try {
       setTemplates(await api.templatesList());
     } catch {
@@ -258,10 +292,41 @@ export function MailProvider({ children }: { children: ReactNode }) {
     else if (modeRef.current === "live") await reloadLive();
   };
 
+  // Sync can announce updates faster than a reload finishes; fold a burst into one follow-up reload.
+  const reloadQueueRef = useRef({ running: false, again: false });
+  function queueReload() {
+    const queue = reloadQueueRef.current;
+    if (queue.running) {
+      queue.again = true;
+      return;
+    }
+    queue.running = true;
+    void (async () => {
+      do {
+        queue.again = false;
+        try {
+          await reloadRef.current();
+        } catch {
+          /* the next update retries */
+        }
+      } while (queue.again);
+      queue.running = false;
+    })();
+  }
+
   useEffect(() => {
+    const prev = shownQueryRef.current;
+    shownQueryRef.current = query;
+    // Typing a search refines the list in place; switching tab, folder, account or page shows a spinner.
+    const switched =
+      !prev || prev.folder !== query.folder || prev.category !== query.category || prev.accountId !== query.accountId || prev.labelId !== query.labelId || prev.offset !== query.offset;
     if (mode === "demo") publishDemo();
     else if (mode === "live") {
-      void reloadLive().catch((error: unknown) => toastRef.current(messageOf(error)));
+      if (switched) setListLoading(true);
+      void reloadLive().catch((error: unknown) => {
+        setListLoading(false);
+        toastRef.current(messageOf(error));
+      });
     }
     // publishDemo and reloadLive read the latest query through refs and state setters.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -349,24 +414,60 @@ export function MailProvider({ children }: { children: ReactNode }) {
         }
         if (next.accounts.length > 0) setMode("live");
         const { listen } = await import("@tauri-apps/api/event");
-        unlisten.push(await listen("mail://updated", () => void reloadRef.current()));
+        unlisten.push(await listen("mail://updated", () => queueReload()));
         unlisten.push(
-          await listen<{ email: string; phase: string }>("sync://progress", (event) => {
+          await listen<{ email: string; phase: string; fetched: number }>("sync://progress", (event) => {
             setSyncing(true);
             setSyncLabel(`${event.payload.phase} · ${event.payload.email}`);
+            const current = setupRef.current;
+            if (current && current.email === event.payload.email && event.payload.phase === "Downloading recent mail") {
+              setSetup({ ...current, fetched: event.payload.fetched });
+            }
           }),
         );
         unlisten.push(
-          await listen<{ ok: boolean; message: string; offline: boolean }>("sync://done", (event) => {
+          await listen<SyncDone>("sync://done", (event) => {
             setSyncing(false);
+            const { accountId } = event.payload;
+            if (accountId) {
+              syncResultsRef.current.set(accountId, event.payload);
+              if (setupRef.current?.accountId === accountId) finishSetup(event.payload);
+            }
             setSyncLabel("");
             setOffline(Boolean(event.payload.offline));
+            if (event.payload.ok) setConnection((prev) => (prev.state === "online" ? prev : { state: "online", latencyMs: prev.latencyMs, message: "" }));
+            else if (event.payload.offline) setConnection({ state: "offline", latencyMs: null, message: event.payload.message });
             if (!event.payload.ok && event.payload.message) toastRef.current(event.payload.message);
           }),
         );
         unlisten.push(
           await listen<Omit<Notice, "id">>("mail://notify", (event) => deliverRef.current(event.payload, settingsRef.current)),
         );
+        unlisten.push(await listen<{ message: string }>("mail://action-failed", (event) => toastRef.current(event.payload.message)));
+        unlisten.push(
+          await listen<Connection>("net://status", (event) => {
+            const next = event.payload;
+            setOffline(next.state === "offline");
+            // A check that downloaded mail is not timed; keep the last round trip we have.
+            setConnection((prev) => ({ ...next, latencyMs: next.latencyMs ?? (next.state === "online" ? prev.latencyMs : null) }));
+          }),
+        );
+        // Windows reports a dropped network at once; Gmail checks only notice on the next tick.
+        const onOffline = () => {
+          setOffline(true);
+          setConnection({ state: "offline", latencyMs: null, message: "This PC is not connected to a network." });
+        };
+        const onOnline = () => {
+          setConnection((prev) => ({ ...prev, state: "checking" }));
+          void api.checkConnection().catch(() => {});
+        };
+        window.addEventListener("offline", onOffline);
+        window.addEventListener("online", onOnline);
+        unlisten.push(() => {
+          window.removeEventListener("offline", onOffline);
+          window.removeEventListener("online", onOnline);
+        });
+        if (!navigator.onLine) onOffline();
         unlisten.push(await listen<Notice>("popup://open", (event) => openNoticeRef.current(event.payload)));
       } catch (error) {
         toastRef.current(messageOf(error));
@@ -385,22 +486,63 @@ export function MailProvider({ children }: { children: ReactNode }) {
     return openRef.current ? [openRef.current] : [];
   }
 
+  function leavesFolder(action: string) {
+    const folder = queryRef.current.folder;
+    if (action === "trash") return folder !== "trash";
+    if (action === "spam") return folder !== "spam";
+    if (action === "archive" || action === "snooze") return folder === "inbox";
+    return false;
+  }
+
+  /**
+   * Drops the rows of conversations an action moves out of the current folder at once, and
+   * covers the open one with LEAVING_TEXT until the change is stored, so it is never redrawn
+   * in its new folder. Call the returned function when the action is done.
+   */
+  function startLeaving(targets: ThreadTarget[], action: string): () => void {
+    const matches = (item: ThreadTarget) => targets.some((target) => target.accountId === item.accountId && target.threadId === item.threadId);
+    if (leavesFolder(action)) {
+      setBox((prev) => {
+        const threads = prev.threads.filter((item) => !matches(item));
+        return { ...prev, threads, total: Math.max(0, prev.total - (prev.threads.length - threads.length)) };
+      });
+    }
+    const open = openRef.current;
+    if (!open || !matches(open)) return () => {};
+    // Cleared now so reloads leave the covered conversation alone.
+    openRef.current = null;
+    setThreadBusy(LEAVING_TEXT[action] ?? "Updating…");
+    return () => {
+      if (!openRef.current) setThread(null);
+      setThreadBusy("");
+    };
+  }
+
   async function modify(targets: ThreadTarget[], action: string, labelId?: string, silent = false) {
     if (targets.length === 0) return;
     if (targets.some((target) => target.threadId.startsWith("sched:"))) {
       toast("Open a scheduled message to send it now or cancel it.");
       return;
     }
-    if (modeRef.current === "demo" && demoRef.current) {
-      for (const target of targets) applyThreadAction(demoRef.current.messages, target.accountId, target.threadId, action, labelId);
-      publishDemo();
-    } else if (modeRef.current === "live") {
-      await api.threadsModify(targets, action, labelId);
-      await reloadLive();
+    const done = action in LEAVING_TEXT ? startLeaving(targets, action) : () => {};
+    try {
+      if (modeRef.current === "demo" && demoRef.current) {
+        for (const target of targets) applyThreadAction(demoRef.current.messages, target.accountId, target.threadId, action, labelId);
+        publishDemo();
+      } else if (modeRef.current === "live") {
+        // Returns as soon as this PC has the change; Gmail is told in the background.
+        await api.threadsModify(targets, action, labelId);
+        await reloadLive();
+      }
+    } catch (error) {
+      // Bring back any rows startLeaving took off.
+      if (modeRef.current === "live") void reloadLive().catch(() => {});
+      throw error;
+    } finally {
+      done();
     }
     const reverse = REVERSE[action];
     if (!silent && reverse) setUndo({ text: ACTION_TEXT[action] ?? "Updated", targets, reverse, labelId });
-    if (["archive", "trash", "spam"].includes(action)) closeThread();
   }
 
   async function act(action: string, labelId?: string, targets?: ThreadTarget[]) {
@@ -423,49 +565,6 @@ export function MailProvider({ children }: { children: ReactNode }) {
     }
   }
 
-  async function deleteForever(targets?: ThreadTarget[]) {
-    const list = targets && targets.length > 0 ? targets : currentTargets();
-    if (list.length === 0) return;
-    try {
-      if (modeRef.current === "demo" && demoRef.current) {
-        const db = demoRef.current;
-        db.messages = db.messages.filter(
-          (message) => !message.labelIds.includes("TRASH") || !list.some((target) => target.accountId === message.accountId && target.threadId === message.threadId),
-        );
-        publishDemo();
-      } else if (modeRef.current === "live") {
-        await api.threadsDeleteForever(list);
-        await reloadLive();
-      }
-      setChecked([]);
-      setUndo(null);
-      closeThread();
-      toast(list.length === 1 ? "Conversation deleted forever" : `${list.length} conversations deleted forever`);
-    } catch (error) {
-      toast(messageOf(error));
-    }
-  }
-
-  async function emptyTrash() {
-    const accountId = queryRef.current.accountId;
-    try {
-      if (modeRef.current === "demo" && demoRef.current) {
-        const db = demoRef.current;
-        db.messages = db.messages.filter((message) => !message.labelIds.includes("TRASH") || (accountId !== null && message.accountId !== accountId));
-        publishDemo();
-      } else if (modeRef.current === "live") {
-        await api.trashEmpty(accountId);
-        await reloadLive();
-      }
-      setChecked([]);
-      setUndo(null);
-      closeThread();
-      toast("Trash emptied");
-    } catch (error) {
-      toast(messageOf(error));
-    }
-  }
-
   async function snooze(until: number, targets?: ThreadTarget[]) {
     const list = targets && targets.length > 0 ? targets : currentTargets();
     if (list.length === 0 || list.some((target) => target.threadId.startsWith("sched:"))) return;
@@ -473,6 +572,7 @@ export function MailProvider({ children }: { children: ReactNode }) {
       toast("Choose a time in the future.");
       return;
     }
+    const done = startLeaving(list, "snooze");
     try {
       if (modeRef.current === "demo" && demoRef.current) {
         for (const target of list) {
@@ -486,9 +586,11 @@ export function MailProvider({ children }: { children: ReactNode }) {
         await reloadLive();
       }
       setUndo({ text: "Snoozed", targets: list, reverse: "unsnooze" });
-      closeThread();
     } catch (error) {
       toast(messageOf(error));
+      if (modeRef.current === "live") void reloadLive().catch(() => {});
+    } finally {
+      done();
     }
   }
 
@@ -686,29 +788,38 @@ export function MailProvider({ children }: { children: ReactNode }) {
       setThread(scheduledThread(summary));
       return;
     }
-    openRef.current = { accountId: summary.accountId, threadId: summary.threadId };
+    const target = { accountId: summary.accountId, threadId: summary.threadId };
+    openRef.current = target;
+    const isCurrent = () => openRef.current === target;
     setThreadLoading(true);
+    // Show the stored copy at once; marking it read waits on Gmail, so that runs behind it.
     try {
-      if (summary.unread) {
-        try {
-          await modify([openRef.current], "read", undefined, true);
-        } catch (error) {
-          toast(messageOf(error));
-          if (modeRef.current === "demo") publishDemo();
-          else setThread(await api.threadGet(summary.accountId, summary.threadId));
-        }
-      } else if (modeRef.current === "demo") publishDemo();
-      else setThread(await api.threadGet(summary.accountId, summary.threadId));
+      if (modeRef.current === "demo") publishDemo();
+      else {
+        const detail = await api.threadGet(summary.accountId, summary.threadId);
+        if (isCurrent()) setThread(detail);
+      }
     } catch (error) {
-      toast(messageOf(error));
+      if (isCurrent()) toast(messageOf(error));
     } finally {
-      setThreadLoading(false);
+      if (isCurrent()) setThreadLoading(false);
     }
+    if (!summary.unread) return;
+    setBox((prev) => ({
+      ...prev,
+      threads: prev.threads.map((item) => (item.accountId === target.accountId && item.threadId === target.threadId ? { ...item, unread: false } : item)),
+    }));
+    modify([target], "read", undefined, true).catch((error: unknown) => {
+      toast(messageOf(error));
+      // Put the row back to unread.
+      void reloadRef.current().catch(() => {});
+    });
   }
 
   function closeThread() {
     openRef.current = null;
     setThread(null);
+    setThreadLoading(false);
   }
 
   function resetListState() {
@@ -823,7 +934,14 @@ export function MailProvider({ children }: { children: ReactNode }) {
     try {
       // The callback server on 127.0.0.1:47821 has to stay up until Google redirects.
       // Closing it when this window is focused again makes the browser report connection refused.
-      await api.signIn();
+      const known = new Set(accountsRef.current.map((item) => item.id));
+      syncResultsRef.current.clear();
+      const account = await api.signIn();
+      if (!known.has(account.id)) {
+        setSetup({ accountId: account.id, email: account.email, fetched: 0, error: "" });
+        const early = syncResultsRef.current.get(account.id);
+        if (early) finishSetup(early);
+      }
       setMode("live");
       await reloadLive();
     } catch (error) {
@@ -832,6 +950,32 @@ export function MailProvider({ children }: { children: ReactNode }) {
     } finally {
       setSignInBusy(false);
     }
+  }
+
+  function setSetup(next: Setup | null) {
+    setupRef.current = next;
+    setSetupState(next);
+  }
+
+  function finishSetup(result: SyncDone) {
+    const current = setupRef.current;
+    if (!current) return;
+    if (result.ok) setSetup(null);
+    else setSetup({ ...current, error: result.message || "Could not download mail from Gmail." });
+  }
+
+  function retrySetup() {
+    const current = setupRef.current;
+    if (!current) return;
+    setSetup({ ...current, error: "" });
+    // sync_all reports back through sync://done, which finishSetup picks up.
+    api.syncNow().catch((error: unknown) => {
+      if (setupRef.current) setSetup({ ...setupRef.current, error: messageOf(error) });
+    });
+  }
+
+  function skipSetup() {
+    setSetup(null);
   }
 
   function cancelSignIn() {
@@ -895,7 +1039,7 @@ export function MailProvider({ children }: { children: ReactNode }) {
     setSettings(saved);
     applyAppearance(saved.theme, saved.density);
     const category = queryRef.current.category;
-    if (queryRef.current.folder === "inbox" && category !== "primary" && !saved.inboxTabs[category]) {
+    if (queryRef.current.folder === "inbox" && category !== "all" && category !== "primary" && !saved.inboxTabs[category]) {
       const nextQuery = { ...queryRef.current, category: "primary" as const, offset: 0 };
       queryRef.current = nextQuery;
       setQuery(nextQuery);
@@ -1142,6 +1286,8 @@ export function MailProvider({ children }: { children: ReactNode }) {
     query,
     thread,
     threadLoading,
+    listLoading,
+    threadBusy,
     checked,
     cursor,
     settings,
@@ -1154,8 +1300,12 @@ export function MailProvider({ children }: { children: ReactNode }) {
     syncing,
     syncLabel,
     offline,
+    connection,
     signInBusy,
     signInError,
+    setup,
+    retrySetup,
+    skipSetup,
     googleReady,
     shownImages,
     remoteNote,
@@ -1179,8 +1329,6 @@ export function MailProvider({ children }: { children: ReactNode }) {
     setCursor,
     act,
     undoAct,
-    deleteForever,
-    emptyTrash,
     saveSettings,
     setSignature,
     setSettingsOpen,

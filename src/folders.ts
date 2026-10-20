@@ -43,6 +43,8 @@ export function messageInFolder(
       const social = tabs.social && (hasLabel(labels, "CATEGORY_SOCIAL") || hasLabel(labels, "CATEGORY_FORUMS"));
       const updates = tabs.updates && hasLabel(labels, "CATEGORY_UPDATES");
       switch (category ?? "primary") {
+        case "all":
+          return true;
         case "promotions":
           return promotions;
         case "social":

@@ -273,50 +273,6 @@ pub async fn untrash_thread(app: &AppHandle, account_id: &str, thread_id: &str) 
     Ok(())
 }
 
-/// Ids of the messages in a conversation that are in Trash. A conversation can be partly
-/// trashed, and deleting forever only touches the trashed messages, as Gmail does.
-pub async fn trashed_message_ids(app: &AppHandle, account_id: &str, thread_id: &str) -> Result<Vec<String>, String> {
-    let url = format!("{}?format=minimal", gmail_path(&["threads", thread_id])?);
-    let value = gmail(app, account_id, Method::GET, url, None).await?;
-    Ok(value["messages"]
-        .as_array()
-        .map(|items| {
-            items
-                .iter()
-                .filter(|item| {
-                    item["labelIds"]
-                        .as_array()
-                        .is_some_and(|labels| labels.iter().any(|label| label.as_str() == Some("TRASH")))
-                })
-                .filter_map(|item| item.get("id").and_then(|id| id.as_str()).map(|id| id.to_string()))
-                .collect()
-        })
-        .unwrap_or_default())
-}
-
-/// Deletes messages for good. Gmail takes at most 1000 ids per call.
-pub async fn delete_messages(app: &AppHandle, account_id: &str, ids: &[String]) -> Result<(), String> {
-    for chunk in ids.chunks(1000) {
-        gmail(
-            app,
-            account_id,
-            Method::POST,
-            users("messages/batchDelete"),
-            Some(json!({ "ids": chunk })),
-        )
-        .await
-        .map_err(|err| {
-            // Sign-ins made before Novabox asked for full Gmail access cannot delete permanently.
-            if err.contains("403") && err.to_ascii_lowercase().contains("insufficient") {
-                "Deleting forever needs more Gmail access than this sign-in has. Add this Gmail account again with the + button, then try again.".to_string()
-            } else {
-                err
-            }
-        })?;
-    }
-    Ok(())
-}
-
 pub async fn send_raw(
     app: &AppHandle,
     account_id: &str,

@@ -12,6 +12,7 @@ use crate::db;
 use crate::files;
 use crate::gmail;
 use crate::mime_build::{self, OutgoingMail};
+use crate::outbox::{self, Job};
 use rand::RngCore;
 
 use crate::model::{
@@ -30,7 +31,8 @@ const COLORS: [&str; 8] = [
     "#C9842A", "#2F7D6D", "#3D5A80", "#8A4E7A", "#C4535A", "#3E6B8A", "#8A6A2F", "#4F6B4A",
 ];
 
-enum Change {
+#[derive(Clone)]
+pub(crate) enum Change {
     Labels { add: Vec<String>, remove: Vec<String> },
     Trash,
     Untrash,
@@ -46,7 +48,8 @@ pub fn app_info(app: AppHandle) -> AppInfo {
     }
 }
 
-#[tauri::command]
+// Async so the query runs off the UI thread; sync commands block the window.
+#[tauri::command(async)]
 pub fn settings_get(app: AppHandle) -> Result<Settings, String> {
     settings::load(&app.state::<AppState>().data_dir)
 }
@@ -73,12 +76,12 @@ pub fn sign_in_cancel(app: AppHandle) {
         .store(true, Ordering::SeqCst);
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn mailbox_query(app: AppHandle, query: ThreadQuery) -> Result<Mailbox, String> {
     with_db(&app, |conn| db::query_mailbox(conn, &query))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn thread_get(app: AppHandle, account_id: String, thread_id: String) -> Result<ThreadDetail, String> {
     with_db(&app, |conn| db::get_thread(conn, &account_id, &thread_id))
 }
@@ -198,7 +201,7 @@ pub async fn threads_modify(app: AppHandle, batch: ModifyBatch) -> Result<(), St
     }
     let change = action_change(&batch.action, batch.label_id.as_deref())?;
     for target in &batch.targets {
-        apply_change(&app, target, &change).await?;
+        change_now(&app, target, &change)?;
         if matches!(batch.action.as_str(), "trash" | "spam") {
             let account_id = target.account_id.clone();
             let thread_id = target.thread_id.clone();
@@ -207,64 +210,6 @@ pub async fn threads_modify(app: AppHandle, batch: ModifyBatch) -> Result<(), St
     }
     crate::refresh_badge(&app);
     let _ = app.emit("mail://updated", json!({}));
-    Ok(())
-}
-
-#[tauri::command]
-/// Deletes the trashed messages of these conversations for good. Messages of the same
-/// conversation that are not in Trash are kept, as in Gmail.
-pub async fn threads_delete_forever(app: AppHandle, targets: Vec<ThreadTarget>) -> Result<(), String> {
-    for target in &targets {
-        let ids = match gmail::trashed_message_ids(&app, &target.account_id, &target.thread_id).await {
-            // Already gone from Gmail; only the copy on this PC is left to clear.
-            Err(err) if err.starts_with("gmail_404:") => vec![],
-            result => result?,
-        };
-        gmail::delete_messages(&app, &target.account_id, &ids).await?;
-        let local = with_db(&app, |conn| {
-            db::trashed_message_ids(conn, &target.account_id, Some(&target.thread_id))
-        })?;
-        forget_messages(&app, &target.account_id, ids.iter().chain(&local))?;
-    }
-    crate::refresh_badge(&app);
-    let _ = app.emit("mail://updated", json!({}));
-    Ok(())
-}
-
-#[tauri::command]
-/// Deletes everything in Trash for good, for one account or for all of them.
-pub async fn trash_empty(app: AppHandle, account_id: Option<String>) -> Result<(), String> {
-    let accounts: Vec<String> = match account_id.filter(|id| !id.is_empty()) {
-        Some(id) => vec![id],
-        None => with_db(&app, db::list_accounts)?.into_iter().map(|account| account.id).collect(),
-    };
-    for id in accounts {
-        let mut ids = Vec::new();
-        let mut page: Option<String> = None;
-        loop {
-            let (batch, next) = gmail::list_label_ids(&app, &id, "TRASH", page.as_deref()).await?;
-            ids.extend(batch);
-            match next {
-                Some(token) => page = Some(token),
-                None => break,
-            }
-        }
-        gmail::delete_messages(&app, &id, &ids).await?;
-        let local = with_db(&app, |conn| db::trashed_message_ids(conn, &id, None))?;
-        forget_messages(&app, &id, ids.iter().chain(&local))?;
-    }
-    crate::refresh_badge(&app);
-    let _ = app.emit("mail://updated", json!({}));
-    Ok(())
-}
-
-/// Removes deleted messages and their saved attachments from this PC.
-fn forget_messages<'a>(app: &AppHandle, account_id: &str, ids: impl Iterator<Item = &'a String>) -> Result<(), String> {
-    let data_dir = app.state::<AppState>().data_dir.clone();
-    for id in ids {
-        with_db(app, |conn| db::delete_message(conn, account_id, id))?;
-        files::remove_message_files(&data_dir, account_id, id);
-    }
     Ok(())
 }
 
@@ -413,6 +358,12 @@ pub async fn sync_now(app: AppHandle) -> Result<(), String> {
     sync::sync_all(&app).await
 }
 
+/// Runs the quick new-mail check now; its result arrives as a `net://status` event.
+#[tauri::command]
+pub async fn check_connection(app: AppHandle) {
+    sync::check_new_mail(&app).await;
+}
+
 #[tauri::command]
 pub async fn threads_snooze(app: AppHandle, targets: Vec<ThreadTarget>, until_at: i64) -> Result<(), String> {
     if targets.is_empty() {
@@ -423,7 +374,7 @@ pub async fn threads_snooze(app: AppHandle, targets: Vec<ThreadTarget>, until_at
     }
     let change = action_change("archive", None)?;
     for target in &targets {
-        apply_change(&app, target, &change).await?;
+        change_now(&app, target, &change)?;
         let account_id = target.account_id.clone();
         let thread_id = target.thread_id.clone();
         with_db(&app, |conn| db::snooze_set(conn, &account_id, &thread_id, until_at))?;
@@ -435,14 +386,20 @@ pub async fn threads_snooze(app: AppHandle, targets: Vec<ThreadTarget>, until_at
 
 #[tauri::command]
 pub async fn threads_unsnooze(app: AppHandle, targets: Vec<ThreadTarget>) -> Result<(), String> {
+    let change = action_change("unarchive", None)?;
     for target in &targets {
-        wake_thread(&app, &target.account_id, &target.thread_id).await?;
+        change_now(&app, target, &change)?;
+        let account_id = target.account_id.clone();
+        let thread_id = target.thread_id.clone();
+        with_db(&app, |conn| db::snooze_clear(conn, &account_id, &thread_id))?;
     }
     crate::refresh_badge(&app);
     let _ = app.emit("mail://updated", json!({}));
     Ok(())
 }
 
+/// Waking a snooze on its timer waits on Gmail: done offline, a rollback would leave the
+/// conversation archived with its snooze already gone.
 pub async fn wake_thread(app: &AppHandle, account_id: &str, thread_id: &str) -> Result<(), String> {
     let target = ThreadTarget {
         account_id: account_id.to_string(),
@@ -483,7 +440,7 @@ pub async fn schedule_send_now(app: AppHandle, id: String) -> Result<SendResult,
     Ok(sent)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn templates_list(app: AppHandle) -> Result<Vec<Template>, String> {
     with_db(&app, db::templates_list)
 }
@@ -554,38 +511,44 @@ pub async fn attachment_save(app: AppHandle, request: SaveAttachmentRequest) -> 
 }
 
 async fn apply_change(app: &AppHandle, target: &ThreadTarget, change: &Change) -> Result<(), String> {
+    remote_change(app, target, change).await?;
+    local_change(app, target, change)
+}
+
+/// Applies a change on this PC and queues it for Gmail, which may refuse it and roll it back.
+fn change_now(app: &AppHandle, target: &ThreadTarget, change: &Change) -> Result<(), String> {
+    let before = with_db(app, |conn| db::thread_labels(conn, &target.account_id, &target.thread_id))?;
+    local_change(app, target, change)?;
+    outbox::push(
+        app,
+        Job::Change {
+            target: target.clone(),
+            change: change.clone(),
+            before,
+        },
+    );
+    Ok(())
+}
+
+pub(crate) async fn remote_change(app: &AppHandle, target: &ThreadTarget, change: &Change) -> Result<(), String> {
     match change {
-        Change::Trash => {
-            gmail::trash_thread(app, &target.account_id, &target.thread_id).await?;
-            with_db(app, |conn| {
-                db::apply_labels(
-                    conn,
-                    &target.account_id,
-                    &target.thread_id,
-                    &["TRASH".into()],
-                    &["INBOX".into()],
-                )
-            })
-        }
-        Change::Untrash => {
-            gmail::untrash_thread(app, &target.account_id, &target.thread_id).await?;
-            with_db(app, |conn| {
-                db::apply_labels(
-                    conn,
-                    &target.account_id,
-                    &target.thread_id,
-                    &["INBOX".into()],
-                    &["TRASH".into()],
-                )
-            })
-        }
+        Change::Trash => gmail::trash_thread(app, &target.account_id, &target.thread_id).await,
+        Change::Untrash => gmail::untrash_thread(app, &target.account_id, &target.thread_id).await,
         Change::Labels { add, remove } => {
-            gmail::modify_thread(app, &target.account_id, &target.thread_id, add, remove).await?;
-            with_db(app, |conn| {
-                db::apply_labels(conn, &target.account_id, &target.thread_id, add, remove)
-            })
+            gmail::modify_thread(app, &target.account_id, &target.thread_id, add, remove).await
         }
     }
+}
+
+pub(crate) fn local_change(app: &AppHandle, target: &ThreadTarget, change: &Change) -> Result<(), String> {
+    let (add, remove): (Vec<String>, Vec<String>) = match change {
+        Change::Trash => (vec!["TRASH".into()], vec!["INBOX".into()]),
+        Change::Untrash => (vec!["INBOX".into()], vec!["TRASH".into()]),
+        Change::Labels { add, remove } => (add.clone(), remove.clone()),
+    };
+    with_db(app, |conn| {
+        db::apply_labels(conn, &target.account_id, &target.thread_id, &add, &remove)
+    })
 }
 
 fn action_change(action: &str, label_id: Option<&str>) -> Result<Change, String> {

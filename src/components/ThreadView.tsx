@@ -5,7 +5,6 @@ import { blockPageMenu, openExternal } from "../platform";
 import { cleanEmail } from "../sanitize";
 import { IconArchive, IconBack, IconStar, IconTrash } from "./Icons";
 import { WhenMenu } from "./WhenMenu";
-import { ConfirmDialog } from "./Dialogs";
 import { useMail } from "../state/MailProvider";
 import type { MessageDetail } from "../types";
 
@@ -15,9 +14,9 @@ export function ThreadView() {
   const snoozeArea = useRef<HTMLDivElement>(null);
   const closeSnooze = useCallback(() => setSnoozeOpen(false), []);
   useDismiss(snoozeArea, snoozeOpen, closeSnooze);
-  const [confirmDelete, setConfirmDelete] = useState(false);
   const thread = mail.thread;
-  if (mail.threadLoading && !thread) return <div className="grid flex-1 place-items-center text-muted">Opening…</div>;
+  if (mail.threadBusy) return <Pending label={mail.threadBusy} />;
+  if (mail.threadLoading && !thread) return <Pending label="Opening…" />;
   if (!thread) return <div className="hidden flex-1 place-items-center text-muted lg:grid">Select a conversation</div>;
   const inTrash = thread.messages.some((message) => message.labelIds.includes("TRASH"));
   const labels = mail.labels.filter((label) => label.accountId === thread.accountId && label.kind === "user" && thread.messages.some((message) => message.labelIds.includes(label.id)));
@@ -37,9 +36,9 @@ export function ThreadView() {
           <>
             <button type="button" className="icon-btn" aria-label="Archive" onClick={() => void mail.act("archive")}><IconArchive /></button>
             {inTrash ? (
-              <button type="button" className="tool-btn" onClick={() => setConfirmDelete(true)}>Delete forever</button>
+              <button type="button" className="tool-btn" title="Move back to the inbox" onClick={() => void mail.act("untrash")}>Restore</button>
             ) : (
-              <button type="button" className="icon-btn" aria-label="Delete" onClick={() => void mail.act("trash")}><IconTrash /></button>
+              <button type="button" className="icon-btn" aria-label="Delete" title="Move to Trash" onClick={() => void mail.act("trash")}><IconTrash /></button>
             )}
             <button type="button" className="icon-btn" aria-label="Star" onClick={() => void mail.act(thread.messages.some((message) => message.starred) ? "unstar" : "star")}><IconStar filled={thread.messages.some((message) => message.starred)} /></button>
             <button type="button" className="tool-btn" onClick={() => void mail.act("unread")}>Unread</button>
@@ -75,15 +74,6 @@ export function ThreadView() {
           ))}
         </div>
       </div>
-      {confirmDelete && (
-        <ConfirmDialog
-          title="Delete forever"
-          body="The messages of this conversation that are in Trash will be deleted from Gmail permanently. This can't be undone."
-          confirmLabel="Delete forever"
-          onConfirm={() => void mail.deleteForever([{ accountId: thread.accountId, threadId: thread.threadId }])}
-          onClose={() => setConfirmDelete(false)}
-        />
-      )}
     </section>
   );
 }
@@ -197,4 +187,15 @@ async function openPreview(
   const file = await mail.previewAttachment(message.accountId, message.id, attachmentId);
   const bytes = Uint8Array.from(atob(file.dataBase64), (char) => char.charCodeAt(0));
   setPreview({ filename: file.filename, mimeType: file.mimeType, url: URL.createObjectURL(new Blob([bytes], { type: file.mimeType })) });
+}
+
+function Pending({ label }: { label: string }) {
+  return (
+    <div className="grid flex-1 place-items-center bg-panel text-muted" role="status" aria-live="polite">
+      <div className="flex flex-col items-center gap-3">
+        <span className="h-8 w-8 animate-spin rounded-full border-2 border-line border-t-accent" aria-hidden />
+        <span className="text-sm">{label}</span>
+      </div>
+    </div>
+  );
 }

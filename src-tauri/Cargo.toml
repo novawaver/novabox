@@ -34,6 +34,7 @@ url = "2"
 chrono = { version = "0.4", features = ["clock"] }
 encoding_rs = "0.8"
 futures-util = "0.3"
+tokio = { version = "1", features = ["sync"] }
 open = "5"
 
 [target.'cfg(windows)'.dependencies]

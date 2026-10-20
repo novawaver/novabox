@@ -148,7 +148,7 @@ export type Mailbox = {
 };
 
 export type Folder = "inbox" | "starred" | "sent" | "drafts" | "snoozed" | "scheduled" | "spam" | "trash" | "label";
-export type Category = "primary" | "promotions" | "social" | "updates";
+export type Category = "all" | "primary" | "promotions" | "social" | "updates";
 
 export type MailQuery = {
   accountId: string | null;

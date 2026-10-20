@@ -14,6 +14,8 @@
   --accent: #c9842a;
   --accent-ink: #2a1c08;
   --hover: #f3ecdf;
+  /* Read rows in the mail list sit a shade below unread ones, which keep the panel colour. */
+  --read: #f3f0e9;
   --selected: #f6e3c6;
   --danger: #a33b32;
   --star: #d39a14;
@@ -36,6 +38,7 @@
   --accent: #e2a85a;
   --accent-ink: #1a1208;
   --hover: #26231e;
+  --read: #181714;
   --selected: #3a2e1c;
   --danger: #e07a72;
   --star: #e2b340;
@@ -54,6 +57,7 @@
   --color-accent: var(--accent);
   --color-accent-ink: var(--accent-ink);
   --color-hover: var(--hover);
+  --color-read: var(--read);
   --color-selected: var(--selected);
   --color-danger: var(--danger);
   --color-star: var(--star);
