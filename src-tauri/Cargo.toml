@@ -36,6 +36,7 @@ encoding_rs = "0.8"
 futures-util = "0.3"
 tokio = { version = "1", features = ["sync"] }
 open = "5"
+tauri-plugin-updater = "2"
 
 [target.'cfg(windows)'.dependencies]
 tauri-winrt-notification = "0.8"

@@ -13,6 +13,7 @@ import type {
   ThreadSummary,
   Template,
   ThreadTarget,
+  UpdateInfo,
 } from "./types";
 import { defaultInboxTabs } from "./types";
 import { inTauri } from "./platform";
@@ -69,6 +70,8 @@ export const api = {
     invoke<ThreadSummary[]>("remote_search", { accountId, query }),
   syncNow: () => invoke<void>("sync_now"),
   checkConnection: () => invoke<void>("check_connection"),
+  updateCheck: () => invoke<UpdateInfo | null>("update_check"),
+  updateInstall: () => invoke<void>("update_install"),
   attachmentGet: (accountId: string, messageId: string, attachmentId: string) =>
     invoke<{ filename: string; mimeType: string; dataBase64: string }>("attachment_get", {
       request: { accountId, messageId, attachmentId },

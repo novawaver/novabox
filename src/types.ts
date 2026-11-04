@@ -263,3 +263,20 @@ export type Notice = {
   threadId?: string | null;
   sender?: string | null;
 };
+
+/** A newer release found on the update feed. */
+export type UpdateInfo = {
+  version: string;
+  currentVersion: string;
+  notes: string | null;
+  /** Release time as a Unix timestamp in seconds, when the feed had one. */
+  dateUnix: number | null;
+};
+
+/** Progress of an update install, sent as the `update://progress` event. */
+export type UpdateProgress = {
+  phase: "downloading" | "installing";
+  downloaded: number;
+  /** Installer size, when the server sent one. */
+  total: number | null;
+};

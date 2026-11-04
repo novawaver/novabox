@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useMail } from "../state/MailProvider";
 import { defaultInboxTabs, type Settings } from "../types";
+import { AboutSection } from "./About";
 import { BackupDialog } from "./BackupDialog";
 
 const SETTINGS_TABS = [
@@ -9,6 +10,7 @@ const SETTINGS_TABS = [
   { id: "notifications", label: "Notifications" },
   { id: "accounts", label: "Accounts" },
   { id: "privacy", label: "Privacy" },
+  { id: "about", label: "About" },
 ] as const;
 type SettingsTab = (typeof SETTINGS_TABS)[number]["id"];
 
@@ -169,6 +171,7 @@ export function SettingsDialog() {
               </p>
             </Section>
           )}
+          {tab === "about" && <AboutSection />}
         </div>
       </div>
       {backup && <BackupDialog mode={backup} onClose={() => setBackup(null)} />}

@@ -22,6 +22,7 @@ import {
   type Notice,
   type Settings,
   type Template,
+  type UpdateInfo,
   type ThreadDetail,
   type ThreadSummary,
   type ThreadTarget,
@@ -125,6 +126,11 @@ export type MailApi = {
   skipSetup: () => void;
   /** Whether this build can sign in to Google (a client ID was set in .env at build time). */
   googleReady: boolean;
+  /** The running build's version, from the desktop app. Empty in the browser preview. */
+  appVersion: string;
+  /** A newer release found by a check, until it is installed. */
+  updateAvailable: UpdateInfo | null;
+  noteUpdate: (info: UpdateInfo | null) => void;
   shownImages: string[];
   remoteNote: string;
   openDemo: () => void;
@@ -216,6 +222,8 @@ export function MailProvider({ children }: { children: ReactNode }) {
   const [signInError, setSignInError] = useState("");
   const [setup, setSetupState] = useState<Setup | null>(null);
   const [googleReady, setGoogleReady] = useState(true);
+  const [appVersion, setAppVersion] = useState("");
+  const [updateAvailable, setUpdateAvailable] = useState<UpdateInfo | null>(null);
   const [shownImages, setShownImages] = useState<string[]>([]);
   const [remoteThreads, setRemoteThreads] = useState<ThreadSummary[] | null>(null);
   const [remoteNote, setRemoteNote] = useState("");
@@ -399,7 +407,10 @@ export function MailProvider({ children }: { children: ReactNode }) {
       try {
         void api
           .appInfo()
-          .then((info) => setGoogleReady(info.googleReady))
+          .then((info) => {
+            setGoogleReady(info.googleReady);
+            setAppVersion(info.version);
+          })
           .catch(() => {});
         const loaded = normalizeSettings(await api.settingsGet());
         setSettings(loaded);
@@ -415,6 +426,12 @@ export function MailProvider({ children }: { children: ReactNode }) {
         if (next.accounts.length > 0) setMode("live");
         const { listen } = await import("@tauri-apps/api/event");
         unlisten.push(await listen("mail://updated", () => queueReload()));
+        unlisten.push(
+          await listen<UpdateInfo>("update://available", (event) => {
+            setUpdateAvailable(event.payload);
+            toastRef.current(`Novabox ${event.payload.version} is ready to install. Open Settings > About.`);
+          }),
+        );
         unlisten.push(
           await listen<{ email: string; phase: string; fetched: number }>("sync://progress", (event) => {
             setSyncing(true);
@@ -1307,6 +1324,9 @@ export function MailProvider({ children }: { children: ReactNode }) {
     retrySetup,
     skipSetup,
     googleReady,
+    appVersion,
+    updateAvailable,
+    noteUpdate: setUpdateAvailable,
     shownImages,
     remoteNote,
     openDemo,

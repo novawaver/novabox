@@ -1,0 +1,47 @@
+name: Release
+
+# Builds the Windows installer, signs it for the updater, and attaches it with latest.json
+# to a draft GitHub release. Publishing the draft makes it the version installed copies find.
+#
+# Repository secrets:
+#   TAURI_SIGNING_PRIVATE_KEY           contents of the updater key (see README, "Build the installer")
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  its password, or empty when it has none
+#   NOVABOX_GOOGLE_CLIENT_ID            the Google OAuth client, as in .env
+#   NOVABOX_GOOGLE_CLIENT_SECRET
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          NOVABOX_GOOGLE_CLIENT_ID: ${{ secrets.NOVABOX_GOOGLE_CLIENT_ID }}
+          NOVABOX_GOOGLE_CLIENT_SECRET: ${{ secrets.NOVABOX_GOOGLE_CLIENT_SECRET }}
+        with:
+          tagName: v__VERSION__
+          releaseName: "Novabox v__VERSION__"
+          releaseBody: "Download the installer below. Installed copies update themselves from Settings > About."
+          releaseDraft: true
+          prerelease: false
+          args: --bundles nsis

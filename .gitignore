@@ -27,3 +27,8 @@ dist-ssr
 .env
 .env.*
 !.env.example
+
+# Installer output from scripts/build-installer.ps1, and updater signing keys
+release
+*.key
+*.key.pub

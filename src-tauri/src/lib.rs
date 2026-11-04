@@ -23,6 +23,7 @@ mod secrets;
 mod settings;
 mod sync;
 mod toast;
+mod updater;
 mod util;
 
 pub(crate) struct AppState {
@@ -143,6 +144,7 @@ fn setup_tray(app: &tauri::App) -> bool {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
@@ -151,6 +153,7 @@ pub fn run() {
             None,
         ))
         .manage(popup::PopupState::default())
+        .manage(updater::UpdateState::default())
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&dir)?;
@@ -176,6 +179,7 @@ pub fn run() {
             });
             let outbox = outbox::start(app.handle());
             app.manage(outbox);
+            updater::start_background_checks(app.handle().clone());
             if setup_tray(app) {
                 app.state::<AppState>()
                     .close_to_tray
@@ -262,7 +266,9 @@ pub fn run() {
             popup::popup_list,
             popup::popup_layout,
             popup::popup_dismiss,
-            popup::popup_open
+            popup::popup_open,
+            updater::update_check,
+            updater::update_install
         ])
         .run(tauri::generate_context!())
         .expect("error while running Novabox");

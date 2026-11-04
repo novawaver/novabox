@@ -1,9 +1,10 @@
 use std::fs;
 use std::path::Path;
 
-/// Google OAuth settings baked into the executable. Values come from the environment, or
-/// from a `.env` file in the project root or in `src-tauri/` (environment wins).
-const BUILD_ENV: [&str; 2] = ["NOVABOX_GOOGLE_CLIENT_ID", "NOVABOX_GOOGLE_CLIENT_SECRET"];
+/// Settings baked into the executable: the Google OAuth client and an optional update feed
+/// override. Values come from the environment, or from a `.env` file in the project root or
+/// in `src-tauri/` (environment wins).
+const BUILD_ENV: [&str; 3] = ["NOVABOX_GOOGLE_CLIENT_ID", "NOVABOX_GOOGLE_CLIENT_SECRET", "NOVABOX_UPDATE_URL"];
 
 fn main() {
     // The Windows title bar, taskbar, and tray icon are loaded from icon.ico
