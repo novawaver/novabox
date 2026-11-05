@@ -22,6 +22,20 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      # The release is named after the version in tauri.conf.json. If that lags behind the
+      # tag, the build is uploaded over the older release instead of making a new one.
+      - name: Check the version matches the tag
+        shell: pwsh
+        run: |
+          $conf = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $package = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $cargo = (Select-String -Path src-tauri/Cargo.toml -Pattern '^version\s*=\s*"(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if ($conf -ne $package -or $conf -ne $cargo) {
+            throw "Versions differ: tauri.conf.json $conf, package.json $package, Cargo.toml $cargo."
+          }
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$conf") {
+            throw "Tag $env:GITHUB_REF_NAME does not match version $conf."
+          }
       - uses: actions/setup-node@v4
         with:
           node-version: 22
