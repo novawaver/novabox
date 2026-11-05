@@ -235,6 +235,16 @@ pub fn set_sync_state(
     Ok(())
 }
 
+/// Saves only the history position, leaving the download progress as it is.
+pub fn set_history_id(conn: &Connection, account_id: &str, history_id: &str) -> Result<(), String> {
+    conn.execute(
+        "UPDATE accounts SET history_id = ?1 WHERE id = ?2",
+        params![history_id, account_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 pub fn update_send_as(conn: &Connection, account_id: &str, send_as: &[SendAs]) -> Result<(), String> {
     conn.execute(
         "UPDATE accounts SET send_as_json = ?1 WHERE id = ?2",
@@ -385,6 +395,98 @@ pub fn delete_message(conn: &Connection, account_id: &str, message_id: &str) -> 
     )
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// A stored message's labels, or `None` when the message is not on this PC.
+pub fn message_labels(conn: &Connection, account_id: &str, message_id: &str) -> Result<Option<Vec<String>>, String> {
+    match conn.query_row(
+        "SELECT label_ids FROM messages WHERE account_id = ?1 AND id = ?2",
+        params![account_id, message_id],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(json) => Ok(Some(json_vec(&json))),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+pub fn set_labels(conn: &Connection, account_id: &str, message_id: &str, labels: &[String]) -> Result<(), String> {
+    conn.execute(
+        "UPDATE messages SET label_ids = ?1 WHERE account_id = ?2 AND id = ?3",
+        params![to_json(&labels), account_id, message_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Ids of the stored messages that carry a label.
+pub fn ids_with_label(conn: &Connection, account_id: &str, label_id: &str) -> Result<HashSet<String>, String> {
+    let mut stmt = conn
+        .prepare("SELECT id FROM messages WHERE account_id = ?1 AND instr(label_ids, ?2) > 0")
+        .map_err(|e| e.to_string())?;
+    let quoted = format!("\"{label_id}\"");
+    let rows = stmt
+        .query_map(params![account_id, quoted], |row| row.get::<_, String>(0))
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<HashSet<_>, _>>().map_err(|e| e.to_string())
+}
+
+/// One entry of Gmail's history: labels added to a message, or removed from it.
+pub struct LabelChange {
+    pub message_id: String,
+    pub add: bool,
+    pub labels: Vec<String>,
+}
+
+/// Applies Gmail's label changes to the stored messages, in the order given. Returns how
+/// many messages ended up with different labels, and the ids that are not on this PC.
+pub fn apply_label_changes(
+    conn: &Connection,
+    account_id: &str,
+    changes: &[LabelChange],
+) -> Result<(usize, Vec<String>), String> {
+    // Per message: its labels as stored and as changed, or `None` when it is not stored.
+    let mut states: HashMap<String, Option<(Vec<String>, Vec<String>)>> = HashMap::new();
+    let mut missing = Vec::new();
+    for change in changes {
+        if !states.contains_key(&change.message_id) {
+            let stored = message_labels(conn, account_id, &change.message_id)?;
+            if stored.is_none() {
+                missing.push(change.message_id.clone());
+            }
+            states.insert(change.message_id.clone(), stored.map(|labels| (labels.clone(), labels)));
+        }
+        let Some(Some((_, labels))) = states.get_mut(&change.message_id) else {
+            continue;
+        };
+        if change.add {
+            for label in &change.labels {
+                if !labels.contains(label) {
+                    labels.push(label.clone());
+                }
+            }
+        } else {
+            labels.retain(|label| !change.labels.contains(label));
+        }
+    }
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let mut updated = 0;
+    for (message_id, state) in &states {
+        let Some((before, after)) = state else {
+            continue;
+        };
+        if before == after {
+            continue;
+        }
+        tx.execute(
+            "UPDATE messages SET label_ids = ?1 WHERE account_id = ?2 AND id = ?3",
+            params![to_json(after), account_id, message_id],
+        )
+        .map_err(|e| e.to_string())?;
+        updated += 1;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok((updated, missing))
 }
 
 pub fn draft_message_id(conn: &Connection, account_id: &str, draft_id: &str) -> Result<Option<String>, String> {
@@ -1211,6 +1313,37 @@ mod tests {
             draft_id: None,
             size_estimate: 10,
         }
+    }
+
+    #[test]
+    fn history_label_changes_apply_in_order() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        upsert_message(&conn, &message("a", "t1", &["INBOX", "UNREAD"], "Lease", "rent is due")).unwrap();
+        upsert_message(&conn, &message("b", "t2", &["INBOX"], "Sale", "watermelon festival")).unwrap();
+        let change = |id: &str, add: bool, labels: &[&str]| LabelChange {
+            message_id: id.into(),
+            add,
+            labels: labels.iter().map(|label| (*label).to_string()).collect(),
+        };
+        let (updated, missing) = apply_label_changes(
+            &conn,
+            "acct",
+            &[
+                change("a", true, &["TRASH"]),
+                change("a", false, &["INBOX", "UNREAD"]),
+                change("b", false, &["INBOX"]),
+                change("b", true, &["INBOX"]),
+                change("gone", true, &["TRASH"]),
+            ],
+        )
+        .unwrap();
+        assert_eq!(updated, 1);
+        assert_eq!(missing, vec!["gone".to_string()]);
+        assert_eq!(message_labels(&conn, "acct", "a").unwrap(), Some(vec!["TRASH".to_string()]));
+        assert_eq!(message_labels(&conn, "acct", "b").unwrap(), Some(vec!["INBOX".to_string()]));
+        assert!(ids_with_label(&conn, "acct", "INBOX").unwrap().contains("b"));
+        assert!(!ids_with_label(&conn, "acct", "INBOX").unwrap().contains("a"));
     }
 
     #[test]

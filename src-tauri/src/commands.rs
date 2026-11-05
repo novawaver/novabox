@@ -355,6 +355,7 @@ pub async fn remote_search(app: AppHandle, account_id: Option<String>, query: St
 #[tauri::command]
 pub async fn sync_now(app: AppHandle) -> Result<(), String> {
     let _ = crate::later::release_due(&app).await;
+    sync::request_label_check(&app);
     sync::sync_all(&app).await
 }
 

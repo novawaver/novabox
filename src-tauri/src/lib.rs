@@ -32,6 +32,8 @@ pub(crate) struct AppState {
     pub tokens: Mutex<HashMap<String, auth::CachedToken>>,
     pub data_dir: std::path::PathBuf,
     pub syncing_accounts: Mutex<HashSet<String>>,
+    /// When each account's labels were last compared with Gmail's lists.
+    pub label_checks: Mutex<HashMap<String, std::time::Instant>>,
     pub sync_all_running: AtomicBool,
     pub close_to_tray: AtomicBool,
     pub due_running: AtomicBool,
@@ -172,6 +174,7 @@ pub fn run() {
                 tokens: Mutex::new(HashMap::new()),
                 data_dir: dir,
                 syncing_accounts: Mutex::new(HashSet::new()),
+                label_checks: Mutex::new(HashMap::new()),
                 sync_all_running: AtomicBool::new(false),
                 close_to_tray: AtomicBool::new(false),
                 due_running: AtomicBool::new(false),

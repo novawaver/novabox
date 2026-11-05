@@ -136,7 +136,7 @@ pub async fn list_message_ids(
     query: &str,
     page_token: Option<&str>,
 ) -> Result<(Vec<String>, Option<String>), String> {
-    list_ids(app, account_id, query, None, page_token).await
+    list_ids(app, account_id, query, None, page_token, 50).await
 }
 
 /// Lists one system label such as SPAM or TRASH. Gmail leaves both out of a plain list
@@ -147,7 +147,17 @@ pub async fn list_label_ids(
     label_id: &str,
     page_token: Option<&str>,
 ) -> Result<(Vec<String>, Option<String>), String> {
-    list_ids(app, account_id, "", Some(label_id), page_token).await
+    list_ids(app, account_id, "", Some(label_id), page_token, 50).await
+}
+
+/// Like `list_label_ids`, in the largest pages Gmail allows, for walking a whole label.
+pub async fn list_label_ids_wide(
+    app: &AppHandle,
+    account_id: &str,
+    label_id: &str,
+    page_token: Option<&str>,
+) -> Result<(Vec<String>, Option<String>), String> {
+    list_ids(app, account_id, "", Some(label_id), page_token, 500).await
 }
 
 async fn list_ids(
@@ -156,11 +166,12 @@ async fn list_ids(
     query: &str,
     label_id: Option<&str>,
     page_token: Option<&str>,
+    page_size: u32,
 ) -> Result<(Vec<String>, Option<String>), String> {
     let mut url = Url::parse(&users("messages")).map_err(|e| e.to_string())?;
     {
         let mut pairs = url.query_pairs_mut();
-        pairs.append_pair("maxResults", "50");
+        pairs.append_pair("maxResults", &page_size.to_string());
         if !query.is_empty() {
             pairs.append_pair("q", query);
         }
@@ -208,6 +219,27 @@ pub async fn get_message(app: &AppHandle, account_id: &str, message_id: &str) ->
             }
         }
     }
+}
+
+/// A message's current labels, without downloading the message itself.
+pub async fn message_labels(app: &AppHandle, account_id: &str, message_id: &str) -> Result<Vec<String>, String> {
+    let value = gmail(
+        app,
+        account_id,
+        Method::GET,
+        message_url(message_id, "format=minimal"),
+        None,
+    )
+    .await?;
+    Ok(value["labelIds"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(|label| label.to_string()))
+                .collect()
+        })
+        .unwrap_or_default())
 }
 
 fn message_url(message_id: &str, query: &str) -> String {

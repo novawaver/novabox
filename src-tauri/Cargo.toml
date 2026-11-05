@@ -1,6 +1,6 @@
 [package]
 name = "novabox"
-version = "0.1.0"
+version = "0.1.1"
 description = "Novabox, a local-only multi-account Gmail client"
 authors = ["Novawave"]
 edition = "2021"

@@ -12,6 +12,11 @@ use crate::model::{Account, SyncProgress};
 use crate::parse;
 use crate::AppState;
 
+/// Labels compared against Gmail's own lists, to repair what a missed change left behind.
+const CHECKED_LABELS: [&str; 3] = ["INBOX", "UNREAD", "STARRED"];
+/// How often an account's labels are compared. Starting Novabox and Sync now compare at once.
+const LABEL_CHECK_EVERY: Duration = Duration::from_secs(30 * 60);
+
 pub async fn sync_all(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
     if state.sync_all_running.swap(true, std::sync::atomic::Ordering::SeqCst) {
@@ -132,6 +137,12 @@ async fn sync_inner(app: &AppHandle, account_id: &str, eager: bool) -> Result<()
                 eprintln!("Novabox {label} sync: {err}");
             }
         }
+        if label_check_due(app, account_id) {
+            match check_labels(app, &account).await {
+                Ok(()) => label_check_done(app, account_id),
+                Err(err) => eprintln!("Novabox label check: {err}"),
+            }
+        }
     }
     if let Ok(drafts) = gmail::list_drafts(app, account_id).await {
         with_db(app, |conn| {
@@ -228,102 +239,319 @@ async fn sync_hidden_label(app: &AppHandle, account: &Account, label: &str) -> R
 
 /// Returns whether anything in the mailbox changed.
 async fn history_sync(app: &AppHandle, account: &Account) -> Result<bool, String> {
+    // The caller's copy can be older than the last sync, so read the saved position again.
+    let account = with_db(app, |conn| db::get_account(conn, &account.id))?;
     let Some(start) = account.history_id.clone() else {
         return Ok(false);
     };
+    let mut changed = false;
+    let mut fresh = Vec::new();
+    let result = follow_history(app, &account, &start, &mut changed, &mut fresh).await;
+    if !fresh.is_empty() && account.initial_done {
+        notify_new_mail(app, &account, &fresh);
+    }
+    match result {
+        Ok(()) => Ok(changed),
+        Err(err) => {
+            // Part of the history was applied before the failure; show that much.
+            if changed {
+                let _ = app.emit("mail://updated", json!({}));
+                crate::refresh_badge(app);
+            }
+            Err(err)
+        }
+    }
+}
+
+/// Walks Gmail's history from `start`, applying it a page at a time. Each page's position
+/// is saved once the page is applied, so a long catch-up that is cut short carries on from
+/// there, and a page that could not be applied in full is read again by the next sync.
+async fn follow_history(
+    app: &AppHandle,
+    account: &Account,
+    start: &str,
+    changed: &mut bool,
+    fresh: &mut Vec<String>,
+) -> Result<(), String> {
     let mut page: Option<String> = None;
-    let mut latest = start.clone();
-    let mut to_fetch = HashSet::new();
-    let mut to_delete = HashSet::new();
     loop {
-        let value = match gmail::history(app, &account.id, &start, page.as_deref()).await {
+        let value = match gmail::history(app, &account.id, start, page.as_deref()).await {
             Ok(value) => value,
             Err(err) if err.starts_with("gmail_404") => {
+                // Gmail no longer keeps history this far back, so start again from recent mail.
                 let mut reset = account.clone();
                 reset.history_id = None;
                 reset.initial_done = false;
                 reset.recent_page_token = None;
                 save_account(app, &reset)?;
-                return Ok(false);
+                return Ok(());
             }
             Err(err) => return Err(err),
         };
-        if let Some(id) = value.get("historyId").and_then(|item| item.as_str()) {
-            latest = id.to_string();
+        let records = entries(&value, "history");
+        let next = value
+            .get("nextPageToken")
+            .and_then(|item| item.as_str())
+            .map(|token| token.to_string());
+        let applied = apply_history(app, account, records).await?;
+        *changed |= applied.changed;
+        fresh.extend(applied.fresh);
+        if let Some(err) = applied.failure {
+            return Err(err);
         }
-        if let Some(records) = value.get("history").and_then(|item| item.as_array()) {
-            for record in records {
-                collect_ids(record, "messagesDeleted", &mut to_delete);
-                collect_ids(record, "messagesAdded", &mut to_fetch);
-                collect_ids(record, "labelsAdded", &mut to_fetch);
-                collect_ids(record, "labelsRemoved", &mut to_fetch);
+        if let Some(position) = position_after(&value, records, next.is_none()) {
+            if position != start {
+                with_db(app, |conn| db::set_history_id(conn, &account.id, &position))?;
             }
         }
-        if let Some(next) = value.get("nextPageToken").and_then(|item| item.as_str()) {
-            page = Some(next.to_string());
-            continue;
+        match next {
+            Some(next) => page = Some(next),
+            None => return Ok(()),
         }
-        break;
+    }
+}
+
+/// What applying one page of history did.
+struct Applied {
+    changed: bool,
+    /// Messages that arrived and were not on this PC before.
+    fresh: Vec<String>,
+    /// Why a message could not be downloaded, when one could not.
+    failure: Option<String>,
+}
+
+async fn apply_history(app: &AppHandle, account: &Account, records: &[Value]) -> Result<Applied, String> {
+    let mut added: Vec<String> = Vec::new();
+    let mut deleted: HashSet<String> = HashSet::new();
+    let mut label_changes: Vec<db::LabelChange> = Vec::new();
+    for record in records {
+        for entry in entries(record, "messagesAdded") {
+            if let Some(id) = entry_message_id(entry) {
+                if !added.contains(&id) {
+                    added.push(id);
+                }
+            }
+        }
+        for (key, add) in [("labelsAdded", true), ("labelsRemoved", false)] {
+            for entry in entries(record, key) {
+                let Some(message_id) = entry_message_id(entry) else {
+                    continue;
+                };
+                let labels = entries(entry, "labelIds")
+                    .iter()
+                    .filter_map(|label| label.as_str().map(|label| label.to_string()))
+                    .collect();
+                label_changes.push(db::LabelChange { message_id, add, labels });
+            }
+        }
+        for entry in entries(record, "messagesDeleted") {
+            if let Some(id) = entry_message_id(entry) {
+                deleted.insert(id);
+            }
+        }
     }
     let data_dir = app.state::<AppState>().data_dir.clone();
-    for id in &to_delete {
-        to_fetch.remove(id);
+    for id in &deleted {
         with_db(app, |conn| db::delete_message(conn, &account.id, id))?;
         files::remove_message_files(&data_dir, &account.id, id);
     }
-    let fetch_list: Vec<String> = to_fetch.into_iter().take(200).collect();
+    // Label changes are applied to the stored messages directly. Downloading every changed
+    // message again would make a bulk delete or archive in Gmail cost one request each.
+    label_changes.retain(|change| !deleted.contains(&change.message_id));
+    let (relabeled, unknown) = with_db(app, |conn| db::apply_label_changes(conn, &account.id, &label_changes))?;
+    let mut fetch: Vec<String> = Vec::new();
     let mut fresh = Vec::new();
-    for id in &fetch_list {
-        if !with_db(app, |conn| db::has_message(conn, &account.id, id))? {
+    for id in added {
+        if deleted.contains(&id) {
+            continue;
+        }
+        if !with_db(app, |conn| db::has_message(conn, &account.id, &id))? {
             fresh.push(id.clone());
         }
+        fetch.push(id);
     }
-    if !fetch_list.is_empty() {
+    // A message whose labels changed but that is not stored yet is downloaded as it is now.
+    for id in unknown {
+        if !fetch.contains(&id) {
+            fetch.push(id);
+        }
+    }
+    let mut failure = None;
+    if !fetch.is_empty() {
         emit(app, &account.email, "Updating inbox", 0);
-        fetch_store(app, &account.id, &account.email, "Updating inbox", 0, &fetch_list).await?;
+        let done = fetch_each(app, &account.id, &account.email, "Updating inbox", 0, &fetch).await;
+        for (id, err) in done.failed {
+            if err.starts_with("gmail_404") {
+                // Deleted in Gmail since this page of history was written.
+                with_db(app, |conn| db::delete_message(conn, &account.id, &id))?;
+                files::remove_message_files(&data_dir, &account.id, &id);
+                fresh.retain(|item| item != &id);
+            } else if failure.is_none() {
+                failure = Some(err);
+            }
+        }
     }
-    let changed = !to_delete.is_empty() || !fetch_list.is_empty();
-    let mut updated = account.clone();
-    updated.history_id = Some(latest);
-    save_account(app, &updated)?;
-    if !fresh.is_empty() && account.initial_done {
-        let thread = with_db(app, |conn| {
-            let thread_id = lookup_or_empty(conn, &account.id, &fresh[0])?;
-            db::get_thread(conn, &account.id, &thread_id)
+    Ok(Applied {
+        changed: !deleted.is_empty() || relabeled > 0 || !fetch.is_empty(),
+        fresh,
+        failure,
+    })
+}
+
+/// Where the next history call should start once a page is applied: Gmail's current
+/// position after the last page, otherwise the newest record of the page.
+fn position_after(page: &Value, records: &[Value], last: bool) -> Option<String> {
+    let current = if last { page.get("historyId").and_then(history_number) } else { None };
+    current
+        .or_else(|| records.iter().filter_map(|record| record.get("id").and_then(history_number)).max())
+        .map(|id| id.to_string())
+}
+
+fn history_number(value: &Value) -> Option<u64> {
+    match value {
+        Value::String(text) => text.parse().ok(),
+        Value::Number(number) => number.as_u64(),
+        _ => None,
+    }
+}
+
+fn entries<'a>(value: &'a Value, key: &str) -> &'a [Value] {
+    value
+        .get(key)
+        .and_then(|item| item.as_array())
+        .map(|items| items.as_slice())
+        .unwrap_or(&[])
+}
+
+fn entry_message_id(entry: &Value) -> Option<String> {
+    entry.get("message")?.get("id")?.as_str().map(|id| id.to_string())
+}
+
+fn notify_new_mail(app: &AppHandle, account: &Account, fresh: &[String]) {
+    let thread = with_db(app, |conn| {
+        let thread_id = lookup_or_empty(conn, &account.id, &fresh[0])?;
+        db::get_thread(conn, &account.id, &thread_id)
+    })
+    .ok();
+    let subject = thread.as_ref().map(|thread| thread.subject.clone()).unwrap_or_default();
+    let sender = thread
+        .as_ref()
+        .and_then(|thread| thread.messages.iter().find(|message| message.id == fresh[0]))
+        .map(|message| {
+            if message.from_name.is_empty() {
+                message.from_email.clone()
+            } else {
+                message.from_name.clone()
+            }
         })
-        .ok();
-        let subject = thread.as_ref().map(|thread| thread.subject.clone()).unwrap_or_default();
-        let sender = thread
-            .as_ref()
-            .and_then(|thread| thread.messages.iter().find(|message| message.id == fresh[0]))
-            .map(|message| {
-                if message.from_name.is_empty() {
-                    message.from_email.clone()
-                } else {
-                    message.from_name.clone()
-                }
-            })
-            .unwrap_or_default();
-        let single = fresh.len() == 1;
-        let body = if single && !subject.is_empty() {
-            subject
-        } else {
-            format!("{} new messages", fresh.len())
-        };
-        let _ = app.emit(
-            "mail://notify",
-            json!({
-                "kind": "mail",
-                "title": format!("New mail — {}", account.email),
-                "body": body,
-                "accountId": account.id,
-                "accountColor": account.color,
-                "threadId": if single { thread.as_ref().map(|thread| thread.thread_id.clone()) } else { None },
-                "sender": if single && !sender.is_empty() { Some(sender) } else { None },
-            }),
-        );
+        .unwrap_or_default();
+    let single = fresh.len() == 1;
+    let body = if single && !subject.is_empty() {
+        subject
+    } else {
+        format!("{} new messages", fresh.len())
+    };
+    let _ = app.emit(
+        "mail://notify",
+        json!({
+            "kind": "mail",
+            "title": format!("New mail — {}", account.email),
+            "body": body,
+            "accountId": account.id,
+            "accountColor": account.color,
+            "threadId": if single { thread.as_ref().map(|thread| thread.thread_id.clone()) } else { None },
+            "sender": if single && !sender.is_empty() { Some(sender) } else { None },
+        }),
+    );
+}
+
+/// Whether it is time to compare this account's labels with Gmail's lists.
+fn label_check_due(app: &AppHandle, account_id: &str) -> bool {
+    let state = app.state::<AppState>();
+    let Ok(checks) = state.label_checks.lock() else {
+        return false;
+    };
+    let due = checks
+        .get(account_id)
+        .map_or(true, |checked| checked.elapsed() >= LABEL_CHECK_EVERY);
+    due
+}
+
+fn label_check_done(app: &AppHandle, account_id: &str) {
+    if let Ok(mut checks) = app.state::<AppState>().label_checks.lock() {
+        checks.insert(account_id.to_string(), Instant::now());
     }
-    Ok(changed)
+}
+
+/// Makes the next full sync of every account compare its labels, however recently it did.
+pub fn request_label_check(app: &AppHandle) {
+    if let Ok(mut checks) = app.state::<AppState>().label_checks.lock() {
+        checks.clear();
+    }
+}
+
+async fn check_labels(app: &AppHandle, account: &Account) -> Result<(), String> {
+    for label in CHECKED_LABELS {
+        check_label(app, account, label).await?;
+    }
+    Ok(())
+}
+
+/// Compares the messages stored under a label with the ids Gmail lists for it, and reads
+/// again the labels of every message the two disagree on. History only reports changes
+/// made after its saved position, so this is what repairs a change an earlier sync missed.
+async fn check_label(app: &AppHandle, account: &Account, label: &str) -> Result<(), String> {
+    let mut listed: HashSet<String> = HashSet::new();
+    let mut token: Option<String> = None;
+    loop {
+        let (ids, next) = gmail::list_label_ids_wide(app, &account.id, label, token.as_deref()).await?;
+        listed.extend(ids);
+        match next {
+            Some(next) => token = Some(next),
+            None => break,
+        }
+    }
+    // `doubtful` are stored here with labels that disagree with Gmail's list; `absent` are
+    // on Gmail's list and not stored here at all.
+    let (doubtful, absent) = with_db(app, |conn| {
+        let stored = db::ids_with_label(conn, &account.id, label)?;
+        let mut doubtful: Vec<String> = stored.difference(&listed).cloned().collect();
+        let mut absent = Vec::new();
+        for id in listed.difference(&stored) {
+            if db::has_message(conn, &account.id, id)? {
+                doubtful.push(id.clone());
+            } else {
+                absent.push(id.clone());
+            }
+        }
+        Ok((doubtful, absent))
+    })?;
+    if !doubtful.is_empty() {
+        emit(app, &account.email, "Checking labels", 0);
+    }
+    let data_dir = app.state::<AppState>().data_dir.clone();
+    for chunk in doubtful.chunks(4) {
+        let lookups = chunk
+            .iter()
+            .map(|id| async move { (id, gmail::message_labels(app, &account.id, id).await) });
+        for (id, result) in join_all(lookups).await {
+            match result {
+                Ok(labels) => with_db(app, |conn| db::set_labels(conn, &account.id, id, &labels))?,
+                Err(err) if err.starts_with("gmail_404") => {
+                    with_db(app, |conn| db::delete_message(conn, &account.id, id))?;
+                    files::remove_message_files(&data_dir, &account.id, id);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+    // Until the older mail is all downloaded, a listed message that is not stored is
+    // simply one the download has not reached yet.
+    if account.backfill_done && !absent.is_empty() {
+        emit(app, &account.email, "Updating inbox", 0);
+        fetch_store(app, &account.id, &account.email, "Updating inbox", 0, &absent).await?;
+    }
+    Ok(())
 }
 
 fn lookup_or_empty(conn: &rusqlite::Connection, account_id: &str, message_id: &str) -> Result<String, String> {
@@ -334,20 +562,7 @@ fn lookup_or_empty(conn: &rusqlite::Connection, account_id: &str, message_id: &s
         .ok_or_else(|| "missing".to_string())
 }
 
-fn collect_ids(record: &Value, key: &str, into: &mut HashSet<String>) {
-    if let Some(items) = record.get(key).and_then(|value| value.as_array()) {
-        for item in items {
-            if let Some(id) = item
-                .get("message")
-                .and_then(|message| message.get("id"))
-                .and_then(|id| id.as_str())
-            {
-                into.insert(id.to_string());
-            }
-        }
-    }
-}
-
+/// Downloads and stores messages. Fails only when none could be stored.
 async fn fetch_store(
     app: &AppHandle,
     account_id: &str,
@@ -356,8 +571,31 @@ async fn fetch_store(
     base: u32,
     ids: &[String],
 ) -> Result<(), String> {
-    let mut fetched = 0u32;
-    let mut first_error: Option<String> = None;
+    let done = fetch_each(app, account_id, email, phase, base, ids).await;
+    if done.stored == 0 {
+        if let Some((_, err)) = done.failed.into_iter().next() {
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+/// What a batch of downloads did: how many messages were stored, and which failed and why.
+struct Fetched {
+    stored: u32,
+    failed: Vec<(String, String)>,
+}
+
+async fn fetch_each(
+    app: &AppHandle,
+    account_id: &str,
+    email: &str,
+    phase: &str,
+    base: u32,
+    ids: &[String],
+) -> Fetched {
+    let mut stored = 0u32;
+    let mut failed = Vec::new();
     // Every refresh makes the window re-query the mailbox, so refresh at most every few seconds.
     let mut last_refresh = Instant::now();
     let mut stale = false;
@@ -365,30 +603,29 @@ async fn fetch_store(
         let futures = chunk.iter().cloned().map(|id| {
             let app = app.clone();
             let account_id = account_id.to_string();
-            async move { gmail::get_message(&app, &account_id, &id).await }
+            async move {
+                let result = gmail::get_message(&app, &account_id, &id).await;
+                (id, result)
+            }
         });
-        for result in join_all(futures).await {
+        for (id, result) in join_all(futures).await {
             match result {
                 Ok(value) => {
                     if let Err(err) = store_message(app, account_id, &value) {
                         eprintln!("Novabox store: {err}");
-                        if first_error.is_none() {
-                            first_error = Some(err);
-                        }
+                        failed.push((id, err));
                     } else {
-                        fetched += 1;
+                        stored += 1;
                     }
                 }
                 Err(err) => {
                     eprintln!("Novabox fetch: {err}");
-                    if first_error.is_none() {
-                        first_error = Some(err);
-                    }
+                    failed.push((id, err));
                 }
             }
         }
-        emit(app, email, phase, base + fetched);
-        stale |= fetched > 0;
+        emit(app, email, phase, base + stored);
+        stale |= stored > 0;
         if stale && last_refresh.elapsed() >= Duration::from_secs(3) {
             let _ = app.emit("mail://updated", json!({}));
             last_refresh = Instant::now();
@@ -398,12 +635,7 @@ async fn fetch_store(
     if stale {
         let _ = app.emit("mail://updated", json!({}));
     }
-    if fetched == 0 {
-        if let Some(err) = first_error {
-            return Err(err);
-        }
-    }
-    Ok(())
+    Fetched { stored, failed }
 }
 
 fn store_message(app: &AppHandle, account_id: &str, value: &Value) -> Result<(), String> {
