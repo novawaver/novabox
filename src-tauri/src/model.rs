@@ -155,6 +155,16 @@ impl Default for InboxTabs {
     }
 }
 
+/// Accounts kept together in the account bar, with one combined inbox.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AccountGroup {
+    pub id: String,
+    pub name: String,
+    pub account_ids: Vec<String>,
+    pub collapsed: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
@@ -172,6 +182,11 @@ pub struct Settings {
     pub popup_corner: String,
     pub popup_max: u32,
     pub popup_preview: bool,
+    /// Shows each account's full address beside its icon in the account bar.
+    pub show_account_emails: bool,
+    /// Top-level order of the account bar: account ids and group ids.
+    pub rail_order: Vec<String>,
+    pub account_groups: Vec<AccountGroup>,
 }
 
 impl Default for Settings {
@@ -190,6 +205,9 @@ impl Default for Settings {
             popup_corner: "bottomRight".into(),
             popup_max: 3,
             popup_preview: true,
+            show_account_emails: false,
+            rail_order: Vec::new(),
+            account_groups: Vec::new(),
         }
     }
 }
@@ -226,6 +244,9 @@ pub struct Mailbox {
 pub struct ThreadQuery {
     #[serde(default)]
     pub account_id: Option<String>,
+    /// The accounts of a group. An empty list is a group with no accounts, so it shows nothing.
+    #[serde(default)]
+    pub account_ids: Option<Vec<String>>,
     pub folder: String,
     #[serde(default)]
     pub label_id: Option<String>,

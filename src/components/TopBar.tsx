@@ -21,6 +21,11 @@ export function TopBar() {
   const mail = useMail();
   const link = describeConnection(mail.connection);
   const status = mail.syncing ? mail.syncLabel || "Syncing…" : mail.offline ? "Offline. Click to try again." : "Up to date. Click to check for new mail.";
+  // An open conversation names its own account, which matters in All inboxes and in groups.
+  const account = mail.accounts.find((item) => item.id === mail.query.accountId);
+  const group = mail.settings.accountGroups.find((item) => item.id === mail.query.groupId);
+  const shownEmail = mail.thread?.accountEmail ?? account?.email;
+  const shownColor = mail.thread?.accountColor ?? account?.color;
   return (
     <header className="flex h-14 shrink-0 items-center gap-3 border-b border-line bg-panel px-3">
       <button type="button" className="icon-btn" aria-label={mail.sidebarOpen ? "Collapse folders" : "Expand folders"} aria-expanded={mail.sidebarOpen} onClick={mail.toggleSidebar}>
@@ -28,8 +33,12 @@ export function TopBar() {
       </button>
       <LogoMark />
       <span className="hidden font-semibold tracking-tight sm:inline">Novabox</span>
+      <span className="flex shrink-0 items-center gap-2 whitespace-nowrap text-sm text-muted">
+        {shownColor && <span className="h-2.5 w-2.5 rounded-full" style={{ background: shownColor }} aria-hidden />}
+        {shownEmail ?? group?.name ?? "All inboxes"}
+      </span>
       <form
-        className="mx-auto flex w-full max-w-2xl items-center gap-2 rounded-full border border-line bg-bg px-3 py-1.5"
+        className="mx-auto flex w-full min-w-0 max-w-2xl items-center gap-2 rounded-full border border-line bg-bg px-3 py-1.5"
         onSubmit={(event) => {
           event.preventDefault();
           void mail.submitSearch();

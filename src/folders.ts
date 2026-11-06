@@ -168,11 +168,13 @@ export function buildMailbox(
   snoozes: SnoozeRow[] = [],
   scheduled: ScheduledRow[] = [],
   tabs: InboxTabs = defaultInboxTabs,
+  accountIds: string[] | null = null,
 ): Mailbox {
-  const scoped = query.accountId ? messages.filter((message) => message.accountId === query.accountId) : messages;
-  const snoozeKeys = new Set(snoozes.filter((item) => !query.accountId || item.accountId === query.accountId).map((item) => `${item.accountId}\t${item.threadId}`));
-  const waiting = scheduled.filter((item) => !query.accountId || item.draft.accountId === query.accountId);
-  const scopedLabels = query.accountId ? labels.filter((label) => label.accountId === query.accountId) : labels;
+  const inScope = (id: string) => (query.accountId ? id === query.accountId : !accountIds || accountIds.includes(id));
+  const scoped = messages.filter((message) => inScope(message.accountId));
+  const snoozeKeys = new Set(snoozes.filter((item) => inScope(item.accountId)).map((item) => `${item.accountId}\t${item.threadId}`));
+  const waiting = scheduled.filter((item) => inScope(item.draft.accountId));
+  const scopedLabels = labels.filter((label) => inScope(label.accountId));
   const nextAccounts = accounts.map((account) => ({
     ...account,
     unread: accountUnread(messages, account.id),

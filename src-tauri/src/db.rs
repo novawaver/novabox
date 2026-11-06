@@ -739,11 +739,20 @@ fn load_scheduled(conn: &Connection, account_id: &str) -> Result<Vec<ScheduledMa
 pub fn query_mailbox(conn: &Connection, query: &ThreadQuery) -> Result<Mailbox, String> {
     let accounts = list_accounts(conn)?;
     let account_filter = query.account_id.clone().unwrap_or_default();
-    let headers = load_headers(conn, &account_filter)?;
+    let in_group = |id: &str| {
+        query
+            .account_ids
+            .as_ref()
+            .map_or(true, |ids| ids.iter().any(|item| item == id))
+    };
+    let mut headers = load_headers(conn, &account_filter)?;
+    headers.retain(|header| in_group(&header.account_id));
     let account_map = account_pairs(&accounts);
     let groups = group_headers(&headers);
-    let snoozes = load_snoozes(conn, &account_filter)?;
-    let scheduled = load_scheduled(conn, &account_filter)?;
+    let mut snoozes = load_snoozes(conn, &account_filter)?;
+    snoozes.retain(|(account_id, _), _| in_group(account_id));
+    let mut scheduled = load_scheduled(conn, &account_filter)?;
+    scheduled.retain(|item| in_group(&item.account_id));
     let tabs = &query.inbox_tabs;
     let mut counts = counts_from(&groups, tabs);
     for ((account_id, thread_id), messages) in &groups {
@@ -771,6 +780,7 @@ pub fn query_mailbox(conn: &Connection, query: &ThreadQuery) -> Result<Mailbox, 
     counts.snoozed = groups.keys().filter(|key| snoozes.contains_key(*key)).count() as i64;
     counts.scheduled = scheduled.len() as i64;
     let mut labels = load_labels(conn, &account_filter)?;
+    labels.retain(|label| in_group(&label.account_id));
     for label in &mut labels {
         if label.kind != "user" {
             continue;
@@ -805,7 +815,7 @@ pub fn query_mailbox(conn: &Connection, query: &ThreadQuery) -> Result<Mailbox, 
         }
         threads
     } else {
-        let matched = match fts_ids(conn, &search, &account_filter)? {
+        let matched = match scoped_fts_ids(conn, &search, &account_filter, query.account_ids.as_deref())? {
             Some(ids) => ids,
             None => like_ids(&headers, &search),
         };
@@ -1002,6 +1012,26 @@ fn load_labels(conn: &Connection, account_id: &str) -> Result<Vec<Label>, String
         })
         .map_err(|e| e.to_string())?;
     rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
+/// A group searches account by account, so one busy account can't use up the result limit.
+fn scoped_fts_ids(
+    conn: &Connection,
+    raw: &str,
+    account_id: &str,
+    group: Option<&[String]>,
+) -> Result<Option<HashSet<(String, String)>>, String> {
+    let Some(group) = group else {
+        return fts_ids(conn, raw, account_id);
+    };
+    let mut matched = HashSet::new();
+    for id in group {
+        match fts_ids(conn, raw, id)? {
+            Some(found) => matched.extend(found),
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(matched))
 }
 
 fn fts_ids(conn: &Connection, raw: &str, account_id: &str) -> Result<Option<HashSet<(String, String)>>, String> {
@@ -1347,6 +1377,44 @@ mod tests {
     }
 
     #[test]
+    fn a_group_shows_only_its_accounts() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        upsert_message(&conn, &message("a", "t1", &["INBOX"], "Lease", "rent is due")).unwrap();
+        let other = StoredMessage {
+            account_id: "other".into(),
+            ..message("b", "t2", &["INBOX"], "Sale", "rent reduced")
+        };
+        upsert_message(&conn, &other).unwrap();
+        let ask = |account_ids: Option<Vec<String>>, search: Option<&str>| {
+            query_mailbox(
+                &conn,
+                &ThreadQuery {
+                    account_id: None,
+                    account_ids,
+                    folder: "inbox".into(),
+                    label_id: None,
+                    category: Some("all".into()),
+                    search: search.map(|text| text.to_string()),
+                    limit: 50,
+                    offset: 0,
+                    inbox_tabs: InboxTabs::default(),
+                },
+            )
+            .unwrap()
+        };
+        assert_eq!(ask(None, None).threads.len(), 2);
+        let group = ask(Some(vec!["other".into()]), None);
+        assert_eq!(group.threads.len(), 1);
+        assert_eq!(group.threads[0].subject, "Sale");
+        assert_eq!(group.counts.inbox, 1);
+        let found = ask(Some(vec!["other".into()]), Some("rent"));
+        assert_eq!(found.threads.len(), 1);
+        assert_eq!(found.threads[0].subject, "Sale");
+        assert!(ask(Some(vec![]), None).threads.is_empty());
+    }
+
+    #[test]
     fn folders_search_and_labels() {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
@@ -1388,6 +1456,7 @@ mod tests {
                 search: None,
                 limit: 50,
                 offset: 0,
+                account_ids: None,
                 inbox_tabs: InboxTabs::default(),
             },
         )
@@ -1407,6 +1476,7 @@ mod tests {
                 search: None,
                 limit: 50,
                 offset: 0,
+                account_ids: None,
                 inbox_tabs: InboxTabs::default(),
             },
         )
@@ -1422,6 +1492,7 @@ mod tests {
                 search: None,
                 limit: 50,
                 offset: 0,
+                account_ids: None,
                 inbox_tabs: InboxTabs {
                     updates: true,
                     ..InboxTabs::default()
@@ -1440,6 +1511,7 @@ mod tests {
                 search: None,
                 limit: 50,
                 offset: 0,
+                account_ids: None,
                 inbox_tabs: InboxTabs {
                     updates: true,
                     ..InboxTabs::default()
@@ -1460,6 +1532,7 @@ mod tests {
                 search: None,
                 limit: 50,
                 offset: 0,
+                account_ids: None,
                 inbox_tabs: InboxTabs::default(),
             },
         )
@@ -1476,6 +1549,7 @@ mod tests {
                 search: None,
                 limit: 50,
                 offset: 0,
+                account_ids: None,
                 inbox_tabs: InboxTabs::default(),
             },
         )
@@ -1507,6 +1581,7 @@ mod tests {
                 search: None,
                 limit: 50,
                 offset: 0,
+                account_ids: None,
                 inbox_tabs: InboxTabs::default(),
             },
         )
@@ -1535,6 +1610,7 @@ mod tests {
                 search: Some("watermelon".into()),
                 limit: 50,
                 offset: 0,
+                account_ids: None,
                 inbox_tabs: InboxTabs::default(),
             },
         )

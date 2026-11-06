@@ -4,6 +4,7 @@ import { createDemo, newId, type DemoDb } from "../demo";
 import { escapeHtml, parseThreadKey, threadKey } from "../format";
 import { applyThreadAction, buildMailbox, threadFrom } from "../folders";
 import { applyAppearance, inTauri } from "../platform";
+import { normalizeRail, ungroup, type RailLayout } from "../rail";
 import { cleanFragment } from "../sanitize";
 import {
   defaultInboxTabs,
@@ -142,6 +143,11 @@ export type MailApi = {
   /** Call when the import dialog closes: switches to the imported accounts if any arrived. */
   finishImport: () => void;
   selectAccount: (id: string | null) => void;
+  selectGroup: (id: string) => void;
+  /** Rearranges the account bar. `change` gets the current order with new accounts filled in. */
+  updateRail: (change: (layout: RailLayout) => RailLayout) => void;
+  removeGroup: (id: string) => void;
+  setShowAccountEmails: (show: boolean) => void;
   setFolder: (folder: Folder, labelId?: string | null) => void;
   setCategory: (category: Category) => void;
   setSearch: (search: string) => void;
@@ -264,10 +270,18 @@ export function MailProvider({ children }: { children: ReactNode }) {
   }
   toastRef.current = toast;
 
+  /** The accounts of the open group, or null when the list isn't showing a group. */
+  function groupScope(asked: MailQuery): string[] | null {
+    if (!asked.groupId) return null;
+    const group = settingsRef.current.accountGroups.find((item) => item.id === asked.groupId);
+    const known = new Set(accountsRef.current.map((account) => account.id));
+    return (group?.accountIds ?? []).filter((id) => known.has(id));
+  }
+
   function publishDemo() {
     const db = demoRef.current;
     if (!db) return;
-    setBox(buildMailbox(db.messages, db.accounts, db.labels, queryRef.current, db.snoozes, db.scheduled, settingsRef.current.inboxTabs));
+    setBox(buildMailbox(db.messages, db.accounts, db.labels, queryRef.current, db.snoozes, db.scheduled, settingsRef.current.inboxTabs, groupScope(queryRef.current)));
     setTemplates(db.templates);
     const open = openRef.current;
     setThread(open ? threadFrom(db.messages, db.accounts, open.accountId, open.threadId) : null);
@@ -276,7 +290,7 @@ export function MailProvider({ children }: { children: ReactNode }) {
   async function reloadLive() {
     const seq = ++loadSeqRef.current;
     const asked = queryRef.current;
-    const next = await api.mailbox(asked, settingsRef.current.inboxTabs);
+    const next = await api.mailbox(asked, settingsRef.current.inboxTabs, groupScope(asked));
     // A newer load is on its way and will fill in the rest.
     if (seq !== loadSeqRef.current) return;
     setBox(next);
@@ -327,7 +341,7 @@ export function MailProvider({ children }: { children: ReactNode }) {
     shownQueryRef.current = query;
     // Typing a search refines the list in place; switching tab, folder, account or page shows a spinner.
     const switched =
-      !prev || prev.folder !== query.folder || prev.category !== query.category || prev.accountId !== query.accountId || prev.labelId !== query.labelId || prev.offset !== query.offset;
+      !prev || prev.folder !== query.folder || prev.category !== query.category || prev.accountId !== query.accountId || prev.groupId !== query.groupId || prev.labelId !== query.labelId || prev.offset !== query.offset;
     if (mode === "demo") publishDemo();
     else if (mode === "live") {
       if (switched) setListLoading(true);
@@ -855,7 +869,35 @@ export function MailProvider({ children }: { children: ReactNode }) {
 
   function selectAccount(id: string | null) {
     resetListState();
-    showQuery({ ...queryRef.current, accountId: id, offset: 0 });
+    showQuery({ ...queryRef.current, accountId: id, groupId: null, offset: 0 });
+  }
+
+  function selectGroup(id: string) {
+    resetListState();
+    showQuery({ ...queryRef.current, accountId: null, groupId: id, offset: 0 });
+  }
+
+  /** Saves settings the window changes by itself, which never touch the Windows start-up entry. */
+  async function patchSettings(patch: Partial<Settings>) {
+    const saved = normalizeSettings({ ...settingsRef.current, ...patch });
+    settingsRef.current = saved;
+    setSettings(saved);
+    try {
+      if (inTauri()) await api.settingsSave(saved);
+      else localStorage.setItem("novabox-settings", JSON.stringify(saved));
+      await reloadRef.current();
+    } catch (error) {
+      toast(messageOf(error));
+    }
+  }
+
+  function updateRail(change: (layout: RailLayout) => RailLayout) {
+    void patchSettings(change(normalizeRail(accountsRef.current, settingsRef.current)));
+  }
+
+  function removeGroup(id: string) {
+    if (queryRef.current.groupId === id) selectAccount(null);
+    updateRail((layout) => ungroup(layout, id));
   }
 
   function setFolder(folder: Folder, labelId: string | null = null) {
@@ -882,7 +924,7 @@ export function MailProvider({ children }: { children: ReactNode }) {
     if (modeRef.current !== "live") return;
     setSyncing(true);
     try {
-      const found = await api.remoteSearch(queryRef.current.accountId, text);
+      const found = await api.remoteSearch(queryRef.current.accountId, text, groupScope(queryRef.current));
       if (hasOperator(text)) {
         setRemoteThreads(found);
         setRemoteNote("Results from Google");
@@ -1092,7 +1134,8 @@ export function MailProvider({ children }: { children: ReactNode }) {
   }
 
   function composeNew(accountId?: string) {
-    const account = box.accounts.find((item) => item.id === (accountId ?? query.accountId)) ?? box.accounts[0];
+    const scoped = groupScope(query)?.[0] ?? query.accountId;
+    const account = box.accounts.find((item) => item.id === (accountId ?? scoped)) ?? box.accounts[0];
     if (!account) return;
     pushCompose(blankCompose(account));
   }
@@ -1337,6 +1380,10 @@ export function MailProvider({ children }: { children: ReactNode }) {
     importSignIns,
     finishImport,
     selectAccount,
+    selectGroup,
+    updateRail,
+    removeGroup,
+    setShowAccountEmails: (show) => void patchSettings({ showAccountEmails: show }),
     setFolder,
     setCategory,
     setSearch,

@@ -36,10 +36,11 @@ export const api = {
   popupDismiss: (id: string) => invoke<void>("popup_dismiss", { id }),
   popupOpen: (notice: Notice) => invoke<void>("popup_open", { notice }),
   settingsSave: (settings: Settings) => invoke<void>("settings_save", { settings }),
-  mailbox: (query: MailQuery, inboxTabs: InboxTabs = defaultInboxTabs) =>
+  mailbox: (query: MailQuery, inboxTabs: InboxTabs = defaultInboxTabs, accountIds: string[] | null = null) =>
     invoke<Mailbox>("mailbox_query", {
       query: {
         accountId: query.accountId,
+        accountIds,
         folder: query.folder,
         labelId: query.labelId,
         category: query.folder === "inbox" ? query.category : null,
@@ -66,8 +67,8 @@ export const api = {
   mailSend: (draft: ComposeDraft) => invoke<SendResult>("mail_send", { request: composePayload(draft) }),
   draftSave: (draft: ComposeDraft) => invoke<SendResult>("draft_save", { request: composePayload(draft) }),
   draftDelete: (accountId: string, draftId: string) => invoke<void>("draft_delete", { accountId, draftId }),
-  remoteSearch: (accountId: string | null, query: string) =>
-    invoke<ThreadSummary[]>("remote_search", { accountId, query }),
+  remoteSearch: (accountId: string | null, query: string, accountIds: string[] | null = null) =>
+    invoke<ThreadSummary[]>("remote_search", { accountId, accountIds, query }),
   syncNow: () => invoke<void>("sync_now"),
   checkConnection: () => invoke<void>("check_connection"),
   updateCheck: () => invoke<UpdateInfo | null>("update_check"),

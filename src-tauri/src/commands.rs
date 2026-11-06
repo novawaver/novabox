@@ -324,15 +324,21 @@ pub async fn draft_delete(app: AppHandle, account_id: String, draft_id: String) 
 }
 
 #[tauri::command]
-pub async fn remote_search(app: AppHandle, account_id: Option<String>, query: String) -> Result<Vec<crate::model::ThreadSummary>, String> {
+pub async fn remote_search(
+    app: AppHandle,
+    account_id: Option<String>,
+    account_ids: Option<Vec<String>>,
+    query: String,
+) -> Result<Vec<crate::model::ThreadSummary>, String> {
     let query = query.trim().to_string();
     if query.is_empty() {
         return Ok(vec![]);
     }
     let accounts = with_db(&app, db::list_accounts)?;
-    let targets: Vec<String> = match account_id.filter(|id| !id.is_empty()) {
-        Some(id) => vec![id],
-        None => accounts.into_iter().map(|account| account.id).collect(),
+    let targets: Vec<String> = match (account_ids, account_id.filter(|id| !id.is_empty())) {
+        (Some(ids), _) => ids,
+        (None, Some(id)) => vec![id],
+        (None, None) => accounts.into_iter().map(|account| account.id).collect(),
     };
     let mut keys = Vec::new();
     for id in targets {

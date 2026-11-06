@@ -107,6 +107,14 @@ export type InboxTabs = {
   updates: boolean;
 };
 
+/** Accounts kept together in the account bar, with one combined inbox. */
+export type AccountGroup = {
+  id: string;
+  name: string;
+  accountIds: string[];
+  collapsed: boolean;
+};
+
 export type Settings = {
   theme: string;
   density: string;
@@ -122,6 +130,11 @@ export type Settings = {
   popupCorner: string;
   popupMax: number;
   popupPreview: boolean;
+  /** Shows each account's full address beside its icon in the account bar. */
+  showAccountEmails: boolean;
+  /** Top-level order of the account bar: account ids and group ids. */
+  railOrder: string[];
+  accountGroups: AccountGroup[];
 };
 
 export type FolderCounts = {
@@ -152,6 +165,8 @@ export type Category = "all" | "primary" | "promotions" | "social" | "updates";
 
 export type MailQuery = {
   accountId: string | null;
+  /** Set while a group's combined inbox is open; `accountId` is null then. */
+  groupId: string | null;
   folder: Folder;
   labelId: string | null;
   category: Category;
@@ -226,6 +241,9 @@ export const defaultSettings: Settings = {
   popupCorner: "bottomRight",
   popupMax: 3,
   popupPreview: true,
+  showAccountEmails: false,
+  railOrder: [],
+  accountGroups: [],
 };
 
 export const emptyCounts: FolderCounts = {
@@ -244,6 +262,7 @@ export const emptyCounts: FolderCounts = {
 
 export const initialQuery: MailQuery = {
   accountId: null,
+  groupId: null,
   folder: "inbox",
   labelId: null,
   category: "primary",

@@ -9,6 +9,7 @@ import { Sidebar } from "./Sidebar";
 import { ThreadView } from "./ThreadView";
 import { TopBar } from "./TopBar";
 import { NoticeStack } from "./Notices";
+import { railWidth } from "../rail";
 import { useMail } from "../state/MailProvider";
 
 export function MailScreen() {
@@ -61,8 +62,11 @@ export function MailScreen() {
       <ComposeDock />
       <SettingsDialog />
       <NoticeStack />
-      {/* Starts just right of the 72px account bar so it never covers the avatars. */}
-      <div className="pointer-events-none fixed bottom-4 left-[88px] z-50 flex max-w-[calc(100vw-104px)] flex-col items-start gap-2">
+      {/* Starts just right of the account bar so it never covers the avatars. */}
+      <div
+        className="pointer-events-none fixed bottom-4 z-50 flex flex-col items-start gap-2"
+        style={{ left: railWidth(mail.settings.showAccountEmails) + 16, maxWidth: `calc(100vw - ${railWidth(mail.settings.showAccountEmails) + 32}px)` }}
+      >
         {mail.undo && (
           <div className="pointer-events-auto flex items-center gap-3 bg-[#241c14]/85 backdrop-blur-sm px-4 py-2 text-sm text-[#f6f1e7] shadow-[var(--shadow)]">
             <span>{mail.undo.text}</span>
