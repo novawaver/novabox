@@ -92,6 +92,8 @@ type SyncDone = { accountId?: string; ok: boolean; message: string; offline: boo
 
 export type MailApi = {
   ready: boolean;
+  /** The first start after an update is preparing the stored mailbox, which can take a minute. */
+  preparing: boolean;
   mode: Mode;
   accounts: Account[];
   labels: Label[];
@@ -204,6 +206,7 @@ export function useMail(): MailApi {
 
 export function MailProvider({ children }: { children: ReactNode }) {
   const [ready, setReady] = useState(false);
+  const [preparing, setPreparing] = useState(false);
   const [mode, setMode] = useState<Mode>("none");
   const [box, setBox] = useState<Mailbox>(emptyBox);
   const [query, setQuery] = useState<MailQuery>(initialQuery);
@@ -426,6 +429,7 @@ export function MailProvider({ children }: { children: ReactNode }) {
           .appInfo()
           .then((info) => {
             setGoogleReady(info.googleReady);
+            setPreparing(info.preparing === true);
             setAppVersion(info.version);
           })
           .catch(() => {});
@@ -1358,6 +1362,7 @@ export function MailProvider({ children }: { children: ReactNode }) {
 
   const apiValue: MailApi = {
     ready,
+    preparing,
     mode,
     accounts: box.accounts,
     labels: box.labels,

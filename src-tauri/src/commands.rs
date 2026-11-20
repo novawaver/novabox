@@ -46,6 +46,7 @@ pub fn app_info(app: AppHandle) -> AppInfo {
         data_dir: app.state::<AppState>().data_dir.display().to_string(),
         redirect_uri: REDIRECT_URI.into(),
         google_ready: !auth::CLIENT_ID.is_empty(),
+        preparing: app.state::<AppState>().preparing.load(Ordering::Relaxed),
     }
 }
 

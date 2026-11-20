@@ -17,9 +17,16 @@ export function MailScreen() {
   if (!mail.ready) {
     return (
       <div className="grid h-full place-items-center bg-bg">
-        <div className="flex items-center gap-3">
-          <LogoMark className="h-10 w-10" />
-          <span className="text-lg font-semibold">Novabox</span>
+        <div className="text-center">
+          <div className="flex items-center justify-center gap-3">
+            <LogoMark className="h-10 w-10" />
+            <span className="text-lg font-semibold">Novabox</span>
+          </div>
+          {mail.preparing && (
+            <p className="mt-4 max-w-sm text-sm text-muted" role="status">
+              Getting your mailbox ready for this version. This happens once and can take a minute for a large mailbox.
+            </p>
+          )}
         </div>
       </div>
     );

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{Manager, WindowEvent};
+use tauri::{Emitter, Manager, WindowEvent};
 
 mod auth;
 mod backup;
@@ -38,6 +38,8 @@ pub(crate) struct AppState {
     /// When each account's labels were last compared with Gmail's lists.
     pub label_checks: Mutex<HashMap<String, std::time::Instant>>,
     pub sync_all_running: AtomicBool,
+    /// Set while an older mailbox gets its list indexes; the database is busy until it clears.
+    pub preparing: AtomicBool,
     pub close_to_tray: AtomicBool,
     pub due_running: AtomicBool,
     pub sign_in_cancel: Arc<AtomicBool>,
@@ -164,6 +166,7 @@ pub fn run() {
             std::fs::create_dir_all(&dir)?;
             toast::register(&app.config().identifier, &dir);
             let db = db::open(&dir.join("novabox.db"))?;
+            let prepare = db::needs_list_indexes(&db);
             let http = reqwest::Client::builder()
                 .user_agent("Novabox/0.1")
                 .timeout(Duration::from_secs(120))
@@ -180,10 +183,29 @@ pub fn run() {
                 syncing_accounts: Mutex::new(HashSet::new()),
                 label_checks: Mutex::new(HashMap::new()),
                 sync_all_running: AtomicBool::new(false),
+                preparing: AtomicBool::new(prepare),
                 close_to_tray: AtomicBool::new(false),
                 due_running: AtomicBool::new(false),
                 sign_in_cancel: Arc::new(AtomicBool::new(false)),
             });
+            if prepare {
+                // Done here, with the window already up, because it can take a minute for a
+                // large mailbox. Everything that needs the database waits on its lock meanwhile.
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    let state = handle.state::<AppState>();
+                    match state.db.lock() {
+                        Ok(db) => {
+                            if let Err(err) = db::build_list_indexes(&db) {
+                                eprintln!("Novabox: {err}");
+                            }
+                        }
+                        Err(err) => eprintln!("Novabox: {err}"),
+                    }
+                    state.preparing.store(false, std::sync::atomic::Ordering::Relaxed);
+                    let _ = handle.emit("mail://updated", serde_json::json!({}));
+                });
+            }
             let outbox = outbox::start(app.handle());
             app.manage(outbox);
             updater::start_background_checks(app.handle().clone());

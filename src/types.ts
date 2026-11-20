@@ -235,6 +235,8 @@ export type AppInfo = {
   redirectUri: string;
   /** False when this build has no Google client ID baked in. */
   googleReady: boolean;
+  /** True while a mailbox from an older version is being prepared, which holds up the list. */
+  preparing?: boolean;
 };
 
 export const defaultInboxTabs: InboxTabs = {

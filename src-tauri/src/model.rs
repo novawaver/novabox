@@ -409,4 +409,6 @@ pub struct AppInfo {
     pub data_dir: String,
     pub redirect_uri: String,
     pub google_ready: bool,
+    /// True while a mailbox from an older version is being prepared, which holds up the list.
+    pub preparing: bool,
 }

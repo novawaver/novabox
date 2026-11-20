@@ -64,7 +64,7 @@ CREATE TABLE IF NOT EXISTS labels (
 CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(account_id, thread_id);
 CREATE INDEX IF NOT EXISTS idx_messages_date ON messages(account_id, date);
 CREATE INDEX IF NOT EXISTS idx_messages_header ON messages(account_id, message_id_header);
-CREATE INDEX IF NOT EXISTS idx_messages_list ON messages(account_id, id, thread_id, date, has_attachments, label_ids, from_name, from_email, subject, snippet);
+CREATE INDEX IF NOT EXISTS idx_messages_sort ON messages(account_id, thread_id, id, date, has_attachments, label_ids);
 CREATE INDEX IF NOT EXISTS idx_messages_unread ON messages(account_id, thread_id, label_ids) WHERE instr(label_ids, '"UNREAD"') > 0 AND instr(label_ids, '"INBOX"') > 0;
 CREATE TABLE IF NOT EXISTS snoozes (
     account_id TEXT NOT NULL,
@@ -150,23 +150,39 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
             conn.execute_batch("ALTER TABLE accounts ADD COLUMN provider TEXT NOT NULL DEFAULT 'gmail';")
                 .map_err(|e| format!("Could not prepare the local mailbox for other mail services: {e}"))?;
         }
-        if version < 4 {
-            // A message's row holds its whole body, so reading the list out of the table walks
-            // the entire file: seconds for a large mailbox, on every refresh. These two indexes
-            // hold only what the list and the unread counts need. Building them reads the
-            // table once, which is the one slow start after updating.
-            conn.execute_batch(LIST_INDEXES)
-                .map_err(|e| format!("Could not speed up the local mailbox: {e}"))?;
-        }
     }
-    if version < 4 {
-        conn.pragma_update(None, "user_version", 4).map_err(|e| e.to_string())?;
+    // A new mailbox has every index from the start. An older one stops at version 3 here and
+    // gets its list indexes from `build_list_indexes`, which can take a while.
+    let reached = if version < 1 { LIST_VERSION } else { 3 };
+    if version < reached {
+        conn.pragma_update(None, "user_version", reached).map_err(|e| e.to_string())?;
     }
     Ok(())
 }
 
+const LIST_VERSION: i64 = 5;
+
+/// Whether this mailbox is from before the list indexes and still has to get them.
+pub fn needs_list_indexes(conn: &Connection) -> bool {
+    conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+        .map_or(false, |version| version < LIST_VERSION)
+}
+
+/// Gives an older mailbox the indexes the list is read from. A message's row holds its whole
+/// body, so reading the list out of the table walks the entire file: seconds for a large
+/// mailbox, on every refresh. The two indexes hold only what the list and the unread counts
+/// need. Building them reads the table twice, which for a large mailbox takes the better part
+/// of a minute, once; the app runs this after its window is up rather than before.
+/// Version 4 had a wider list index, which the one here replaces.
+pub fn build_list_indexes(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(LIST_INDEXES)
+        .and_then(|_| conn.execute_batch("DROP INDEX IF EXISTS idx_messages_list;"))
+        .and_then(|_| conn.pragma_update(None, "user_version", LIST_VERSION))
+        .map_err(|e| format!("Could not speed up the local mailbox: {e}"))
+}
+
 const LIST_INDEXES: &str = r#"
-CREATE INDEX IF NOT EXISTS idx_messages_list ON messages(account_id, id, thread_id, date, has_attachments, label_ids, from_name, from_email, subject, snippet);
+CREATE INDEX IF NOT EXISTS idx_messages_sort ON messages(account_id, thread_id, id, date, has_attachments, label_ids);
 CREATE INDEX IF NOT EXISTS idx_messages_unread ON messages(account_id, thread_id, label_ids) WHERE instr(label_ids, '"UNREAD"') > 0 AND instr(label_ids, '"INBOX"') > 0;
 "#;
 
@@ -835,128 +851,136 @@ pub fn query_mailbox(conn: &Connection, query: &ThreadQuery) -> Result<Mailbox, 
             .as_ref()
             .map_or(true, |ids| ids.iter().any(|item| item == id))
     };
-    let mut headers = load_headers(conn, &account_filter)?;
-    headers.retain(|header| in_group(&header.account_id));
-    let account_map = account_pairs(&accounts);
-    let groups = group_headers(headers);
-    let mut snoozes = load_snoozes(conn, &account_filter)?;
-    snoozes.retain(|(account_id, _), _| in_group(account_id));
+    let scope = if account_filter.is_empty() { Scope::Everything } else { Scope::Account(&account_filter) };
+    let wanted = if query.folder == "label" { query.label_id.as_deref() } else { None };
+    let mut owners = owners(&accounts);
+    let loaded = load_conversations(conn, &mut owners, &in_group, scope, wanted)?;
+    let conversations = &loaded.conversations;
+    let tabs = &query.inbox_tabs;
+    // Where each snoozed conversation is in the list, and when it comes back.
+    let snoozes = load_snoozes(conn, &account_filter)?;
+    let mut snoozed: HashMap<usize, i64> = HashMap::new();
+    if !snoozes.is_empty() {
+        let waiting: HashMap<(usize, &str), i64> = snoozes
+            .iter()
+            .filter_map(|((account_id, thread_id), until)| {
+                let owner = owners.iter().position(|owner| &owner.id == account_id)?;
+                Some(((owner, thread_id.as_str()), *until))
+            })
+            .collect();
+        for (place, conversation) in conversations.iter().enumerate() {
+            if let Some(until) = waiting.get(&(conversation.account, conversation.thread_id.as_str())) {
+                snoozed.insert(place, *until);
+            }
+        }
+    }
     let mut scheduled = load_scheduled(conn, &account_filter)?;
     scheduled.retain(|item| in_group(&item.account_id));
-    let tabs = &query.inbox_tabs;
-    let mut counts = counts_from(&groups, tabs);
-    for ((account_id, thread_id), messages) in &groups {
-        let key = (account_id.clone(), thread_id.clone());
-        if !snoozes.contains_key(&key) || !thread_in(messages, "inbox", None, None, tabs) {
+    let mut counts = count_folders(&loaded, tabs);
+    let inbox = View::new("inbox", None, tabs);
+    for place in snoozed.keys() {
+        let conversation = loaded.messages_of(&conversations[*place]);
+        if !inbox.has(conversation) {
             continue;
         }
         counts.inbox -= 1;
-        if unread_in(messages, "inbox", None, None, tabs) {
+        if inbox.has_unread(conversation) {
             counts.inbox_unread -= 1;
         }
-        if unread_in(messages, "inbox", None, Some("primary"), tabs) {
+        if View::new("inbox", Some("primary"), tabs).has_unread(conversation) {
             counts.primary_unread -= 1;
         }
-        if unread_in(messages, "inbox", None, Some("promotions"), tabs) {
+        if View::new("inbox", Some("promotions"), tabs).has_unread(conversation) {
             counts.promotions_unread -= 1;
         }
-        if unread_in(messages, "inbox", None, Some("social"), tabs) {
+        if View::new("inbox", Some("social"), tabs).has_unread(conversation) {
             counts.social_unread -= 1;
         }
-        if unread_in(messages, "inbox", None, Some("updates"), tabs) {
+        if View::new("inbox", Some("updates"), tabs).has_unread(conversation) {
             counts.updates_unread -= 1;
         }
     }
-    counts.snoozed = groups.keys().filter(|key| snoozes.contains_key(*key)).count() as i64;
+    counts.snoozed = snoozed.len() as i64;
     counts.scheduled = scheduled.len() as i64;
     let mut labels = load_labels(conn, &account_filter)?;
     labels.retain(|label| in_group(&label.account_id));
     // One pass over the conversations, counting each once per label it has unread mail under.
-    let mut label_unread: HashMap<(&str, &str), i64> = HashMap::new();
-    for ((account_id, _), messages) in &groups {
-        let mut seen: Vec<&str> = Vec::new();
-        for message in messages {
-            if !has_label(&message.label_ids, "UNREAD") || has_label(&message.label_ids, "TRASH") {
-                continue;
-            }
-            for label in &message.label_ids {
-                if !seen.contains(&label.as_str()) {
-                    seen.push(label);
-                }
-            }
-        }
-        for label in seen {
-            *label_unread.entry((account_id.as_str(), label)).or_default() += 1;
+    let mut label_unread: HashMap<(usize, &str), i64> = HashMap::new();
+    for conversation in conversations {
+        for label in &conversation.unread_labels {
+            *label_unread.entry((conversation.account, label.as_str())).or_default() += 1;
         }
     }
     for label in &mut labels {
-        if label.kind == "user" {
-            label.unread = label_unread
-                .get(&(label.account_id.as_str(), label.id.as_str()))
-                .copied()
-                .unwrap_or(0);
+        if label.kind != "user" {
+            continue;
         }
+        label.unread = owners
+            .iter()
+            .position(|owner| owner.id == label.account_id)
+            .and_then(|account| label_unread.get(&(account, label.id.as_str())))
+            .copied()
+            .unwrap_or(0);
     }
-    drop(label_unread);
     let search = query.search.as_deref().unwrap_or("").trim().to_string();
-    let threads = if query.folder == "scheduled" && search.is_empty() {
-        scheduled_threads(&scheduled, &account_map)
-    } else if query.folder == "snoozed" && search.is_empty() {
-        let waiting: HashMap<_, _> = groups.into_iter().filter(|(key, _)| snoozes.contains_key(key)).collect();
-        let mut threads = summarize(waiting, &account_map, "all", None, None, tabs);
-        for thread in &mut threads {
-            thread.snooze_until = snoozes.get(&(thread.account_id.clone(), thread.thread_id.clone())).copied();
-        }
-        threads.retain(|thread| !has_label(&thread.label_ids, "TRASH") && !has_label(&thread.label_ids, "SPAM"));
-        threads
-    } else if search.is_empty() {
-        let mut threads = summarize(groups, &account_map, &query.folder, query.label_id.as_deref(), query.category.as_deref(), tabs);
-        if query.folder == "inbox" {
-            threads.retain(|thread| !snoozes.contains_key(&(thread.account_id.clone(), thread.thread_id.clone())));
-        }
-        threads
-    } else {
-        let headers: Vec<Header> = groups.into_values().flatten().collect();
-        let matched = match scoped_fts_ids(conn, &search, &account_filter, query.account_ids.as_deref())? {
-            Some(ids) => ids,
-            None => like_ids(&headers, &search),
-        };
-        let filtered: Vec<Header> = headers
-            .into_iter()
-            .filter(|header| matched.contains(&(header.account_id.clone(), header.id.clone())))
-            .collect();
-        summarize(group_headers(filtered), &account_map, "all", None, None, tabs)
-    };
     let offset = query.offset.max(0) as usize;
     let limit = query.limit.clamp(1, 200) as usize;
-    let total = threads.len();
-    let has_more = total > offset + limit;
-    let threads = threads.into_iter().skip(offset).take(limit).collect();
+    if query.folder == "scheduled" && search.is_empty() {
+        let threads = scheduled_threads(&scheduled, &account_pairs(&accounts));
+        let total = threads.len();
+        let threads = threads.into_iter().skip(offset).take(limit).collect();
+        return Ok(Mailbox { accounts, labels, threads, has_more: total > offset + limit, total, counts });
+    }
+    let lines = if query.folder == "snoozed" && search.is_empty() {
+        let mut lines = summarize(&loaded, |place| snoozed.contains_key(&place), |_| true);
+        lines.retain(|line| line.latest.flags & (TRASH | SPAM) == 0);
+        lines
+    } else if search.is_empty() {
+        let view = View::new(&query.folder, query.category.as_deref(), tabs);
+        let hide_snoozed = query.folder == "inbox";
+        summarize(
+            &loaded,
+            |place| !(hide_snoozed && snoozed.contains_key(&place)),
+            |message| view.holds(message.flags),
+        )
+    } else {
+        let matched = matched_rows(conn, &search, &account_filter, query.account_ids.as_deref())?;
+        summarize(&loaded, |_| true, |message| matched.contains(&message.rowid))
+    };
+    let total = lines.len();
+    // Only the page on screen is read in full; the rest of the mailbox never leaves the index.
+    let page: Vec<&Line> = lines.iter().skip(offset).take(limit).collect();
+    let mut threads = hydrate(conn, &owners, conversations, &page)?;
+    if query.folder == "snoozed" && search.is_empty() {
+        for (thread, line) in threads.iter_mut().zip(&page) {
+            thread.snooze_until = snoozed.get(&line.conversation).copied();
+        }
+    }
     Ok(Mailbox {
         accounts,
         labels,
         threads,
-        has_more,
+        has_more: total > offset + limit,
         total,
         counts,
     })
 }
 
 pub fn threads_for_messages(conn: &Connection, keys: &[(String, String)]) -> Result<Vec<ThreadSummary>, String> {
-    let accounts = list_accounts(conn)?;
-    let account_map = account_pairs(&accounts);
+    let mut owners = owners(&list_accounts(conn)?);
     let mut seen = HashSet::new();
-    let mut headers = Vec::new();
+    let mut found = Loaded::default();
     for (account_id, message_id) in keys {
         if let Some(thread_id) = lookup_thread(conn, account_id, message_id)? {
             if seen.insert((account_id.clone(), thread_id.clone())) {
-                headers.extend(load_thread_headers(conn, account_id, &thread_id)?);
+                let loaded = load_conversations(conn, &mut owners, &|_| true, Scope::Thread(account_id, &thread_id), None)?;
+                found.append(loaded);
             }
         }
     }
-    let mut threads = summarize(group_headers(headers), &account_map, "all", None, None, &InboxTabs::default());
-    threads.truncate(200);
-    Ok(threads)
+    let lines = summarize(&found, |_| true, |_| true);
+    let page: Vec<&Line> = lines.iter().take(200).collect();
+    hydrate(conn, &owners, &found.conversations, &page)
 }
 
 // The unread queries below repeat the exact condition of idx_messages_unread, which is what
@@ -1048,62 +1072,491 @@ fn read_message(row: &rusqlite::Row) -> rusqlite::Result<MessageDetail> {
     })
 }
 
-#[derive(Clone)]
-struct Header {
-    account_id: String,
-    id: String,
-    thread_id: String,
-    from_name: String,
-    from_email: String,
-    subject: String,
-    snippet: String,
+// ---------------------------------------------------------------------------------------
+// The conversation list
+//
+// Every refresh of the list sorts the whole mailbox into folders and counts it, so this is
+// kept cheap per message: a row id, a date and a few bits, read from idx_messages_sort.
+// Names, subjects and previews are read afterwards, for the one page that is shown.
+// ---------------------------------------------------------------------------------------
+
+const INBOX: u16 = 1 << 0;
+const UNREAD: u16 = 1 << 1;
+const STARRED: u16 = 1 << 2;
+const SENT: u16 = 1 << 3;
+const DRAFT: u16 = 1 << 4;
+const TRASH: u16 = 1 << 5;
+const SPAM: u16 = 1 << 6;
+const PROMOTIONS: u16 = 1 << 7;
+const SOCIAL: u16 = 1 << 8;
+const UPDATES: u16 = 1 << 9;
+const ATTACHMENT: u16 = 1 << 10;
+/// Carries the label whose folder is being shown.
+const WANTED: u16 = 1 << 11;
+
+#[derive(Clone, Copy)]
+struct Lean {
+    rowid: i64,
     date: i64,
-    label_ids: Vec<String>,
-    has_attachments: bool,
+    flags: u16,
 }
 
-const HEADER_COLUMNS: &str =
-    "SELECT account_id, id, thread_id, from_name, from_email, subject, snippet, date, label_ids, has_attachments FROM messages";
-
-fn read_header(row: &rusqlite::Row) -> rusqlite::Result<Header> {
-    let label_ids: Vec<String> = json_vec(&row.get::<_, String>(8)?);
-    Ok(Header {
-        account_id: row.get(0)?,
-        id: row.get(1)?,
-        thread_id: row.get(2)?,
-        from_name: row.get(3)?,
-        from_email: row.get(4)?,
-        subject: row.get(5)?,
-        snippet: row.get(6)?,
-        date: row.get(7)?,
-        label_ids,
-        has_attachments: row.get::<_, i64>(9)? != 0,
-    })
+struct Conversation {
+    /// Position of its owner in the owner list.
+    account: usize,
+    thread_id: String,
+    /// Where its messages start in the loaded list, and how many there are.
+    first: usize,
+    count: usize,
+    /// Labels other than the built-in ones that it has unread mail under.
+    unread_labels: Vec<String>,
 }
 
-/// The list data of every message, or of one account's. Every column comes from
-/// idx_messages_list, so the message bodies are never read.
-fn load_headers(conn: &Connection, account_id: &str) -> Result<Vec<Header>, String> {
-    // Two statements, since a combined "all or this one" condition would stop SQLite from
-    // going straight to the one account in the index.
-    let (sql, args): (String, &[&dyn rusqlite::ToSql]) = if account_id.is_empty() {
-        (HEADER_COLUMNS.to_string(), &[])
-    } else {
-        (format!("{HEADER_COLUMNS} WHERE account_id = ?1"), &[&account_id])
+/// Whose mail a conversation is: an account, or the id left on mail whose account is gone.
+struct Owner {
+    id: String,
+    email: String,
+    color: String,
+}
+
+fn owners(accounts: &[Account]) -> Vec<Owner> {
+    accounts
+        .iter()
+        .map(|account| Owner {
+            id: account.id.clone(),
+            email: account.email.clone(),
+            color: account.color.clone(),
+        })
+        .collect()
+}
+
+/// Conversations and their messages, each conversation's messages side by side in one
+/// list. One list rather than one per conversation: most conversations are a single message,
+/// and a large mailbox has tens of thousands.
+#[derive(Default)]
+struct Loaded {
+    conversations: Vec<Conversation>,
+    messages: Vec<Lean>,
+}
+
+impl Loaded {
+    fn messages_of(&self, conversation: &Conversation) -> &[Lean] {
+        &self.messages[conversation.first..conversation.first + conversation.count]
+    }
+
+    fn append(&mut self, other: Loaded) {
+        let shift = self.messages.len();
+        self.messages.extend(other.messages);
+        self.conversations.extend(other.conversations.into_iter().map(|mut conversation| {
+            conversation.first += shift;
+            conversation
+        }));
+    }
+}
+
+enum Scope<'a> {
+    Everything,
+    Account(&'a str),
+    Thread(&'a str, &'a str),
+}
+
+/// The ids in a stored label list. It is a JSON list of plain ids, so every second piece
+/// between quotes is one.
+fn label_ids_in(text: &str) -> impl Iterator<Item = &str> {
+    text.split('"').skip(1).step_by(2)
+}
+
+fn label_flag(label: &str) -> u16 {
+    match label {
+        "INBOX" => INBOX,
+        "UNREAD" => UNREAD,
+        "STARRED" => STARRED,
+        "SENT" => SENT,
+        "DRAFT" => DRAFT,
+        "TRASH" => TRASH,
+        "SPAM" => SPAM,
+        "CATEGORY_PROMOTIONS" => PROMOTIONS,
+        "CATEGORY_SOCIAL" | "CATEGORY_FORUMS" => SOCIAL,
+        "CATEGORY_UPDATES" => UPDATES,
+        _ => 0,
+    }
+}
+
+fn load_conversations(
+    conn: &Connection,
+    accounts: &mut Vec<Owner>,
+    allowed: &dyn Fn(&str) -> bool,
+    scope: Scope,
+    wanted: Option<&str>,
+) -> Result<Loaded, String> {
+    const COLUMNS: &str = "SELECT rowid, account_id, thread_id, date, has_attachments, label_ids FROM messages";
+    // Separate statements, since one "all or this account" condition would stop SQLite from
+    // going straight to the account in the index. The order is the index's own, so it costs
+    // nothing, and it brings a conversation's messages out one after another.
+    const ORDER: &str = "ORDER BY account_id, thread_id";
+    let (sql, args): (String, Vec<&dyn rusqlite::ToSql>) = match &scope {
+        Scope::Everything => (format!("{COLUMNS} {ORDER}"), vec![]),
+        Scope::Account(account_id) => (format!("{COLUMNS} WHERE account_id = ?1 {ORDER}"), vec![account_id]),
+        Scope::Thread(account_id, thread_id) => (
+            format!("{COLUMNS} WHERE account_id = ?1 AND thread_id = ?2 {ORDER}"),
+            vec![account_id, thread_id],
+        ),
     };
-    let mut stmt = conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
-    let rows = stmt.query_map(args, read_header).map_err(|e| e.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    let mut open: Vec<bool> = accounts.iter().map(|account| allowed(&account.id)).collect();
+    let mut loaded = Loaded::default();
+    let failed = |e: rusqlite::Error| e.to_string();
+    let unreadable = |e: rusqlite::types::FromSqlError| e.to_string();
+    let mut stmt = conn.prepare_cached(&sql).map_err(failed)?;
+    let mut rows = stmt.query(args.as_slice()).map_err(failed)?;
+    // An account's rows come one after another, so the last account found is usually right.
+    let mut account = 0;
+    while let Some(row) = rows.next().map_err(failed)? {
+        let account_id = row.get_ref(1).map_err(failed)?.as_str().map_err(unreadable)?;
+        if accounts.get(account).map_or(true, |known| known.id != account_id) {
+            account = match accounts.iter().position(|known| known.id == account_id) {
+                Some(found) => found,
+                None => {
+                    accounts.push(Owner { id: account_id.to_string(), email: String::new(), color: "#888888".into() });
+                    open.push(allowed(account_id));
+                    accounts.len() - 1
+                }
+            };
+        }
+        if !open[account] {
+            continue;
+        }
+        let thread_id = row.get_ref(2).map_err(failed)?.as_str().map_err(unreadable)?;
+        let labels = row.get_ref(5).map_err(failed)?.as_str().map_err(unreadable)?;
+        let mut flags = 0;
+        for label in label_ids_in(labels) {
+            flags |= label_flag(label);
+            if wanted == Some(label) {
+                flags |= WANTED;
+            }
+        }
+        if row.get::<_, i64>(4).map_err(failed)? != 0 {
+            flags |= ATTACHMENT;
+        }
+        let continues = loaded
+            .conversations
+            .last()
+            .is_some_and(|last| last.account == account && last.thread_id == thread_id);
+        if !continues {
+            loaded.conversations.push(Conversation {
+                account,
+                thread_id: thread_id.to_string(),
+                first: loaded.messages.len(),
+                count: 0,
+                unread_labels: Vec::new(),
+            });
+        }
+        loaded.messages.push(Lean {
+            rowid: row.get(0).map_err(failed)?,
+            date: row.get(3).map_err(failed)?,
+            flags,
+        });
+        let conversation = loaded.conversations.last_mut().expect("just pushed");
+        conversation.count += 1;
+        if flags & UNREAD != 0 && flags & TRASH == 0 {
+            for label in label_ids_in(labels) {
+                let built_in = label_flag(label) != 0 || label.starts_with("CATEGORY_");
+                if !built_in && !conversation.unread_labels.iter().any(|known| known == label) {
+                    conversation.unread_labels.push(label.to_string());
+                }
+            }
+        }
+    }
+    Ok(loaded)
 }
 
-fn load_thread_headers(conn: &Connection, account_id: &str, thread_id: &str) -> Result<Vec<Header>, String> {
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    All,
+    Inbox,
+    Starred,
+    Sent,
+    Drafts,
+    Spam,
+    Trash,
+    Label,
+    Nothing,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Tab {
+    All,
+    Primary,
+    Promotions,
+    Social,
+    Updates,
+}
+
+/// A folder, as a test of one message's flags.
+#[derive(Clone, Copy)]
+struct View {
+    kind: Kind,
+    tab: Tab,
+    promotions: bool,
+    social: bool,
+    updates: bool,
+}
+
+impl View {
+    /// With no category, the inbox means its Primary tab.
+    fn new(folder: &str, category: Option<&str>, tabs: &InboxTabs) -> View {
+        View {
+            kind: match folder {
+                "all" => Kind::All,
+                "inbox" => Kind::Inbox,
+                "starred" => Kind::Starred,
+                "sent" => Kind::Sent,
+                "drafts" => Kind::Drafts,
+                "spam" => Kind::Spam,
+                "trash" => Kind::Trash,
+                "label" => Kind::Label,
+                _ => Kind::Nothing,
+            },
+            tab: match category.unwrap_or("primary") {
+                "all" => Tab::All,
+                "promotions" => Tab::Promotions,
+                "social" => Tab::Social,
+                "updates" => Tab::Updates,
+                _ => Tab::Primary,
+            },
+            promotions: tabs.promotions,
+            social: tabs.social,
+            updates: tabs.updates,
+        }
+    }
+
+    fn holds(&self, flags: u16) -> bool {
+        let has = |flag: u16| flags & flag != 0;
+        let trash = has(TRASH);
+        let spam = has(SPAM);
+        match self.kind {
+            Kind::All => true,
+            Kind::Inbox => {
+                if !has(INBOX) || trash || spam {
+                    return false;
+                }
+                // Gmail keeps a category in Primary until that inbox tab is turned on.
+                // Updates is off by default, so CATEGORY_UPDATES mail stays in Primary.
+                let promotions = self.promotions && has(PROMOTIONS);
+                let social = self.social && has(SOCIAL);
+                let updates = self.updates && has(UPDATES);
+                match self.tab {
+                    Tab::All => true,
+                    Tab::Promotions => promotions,
+                    Tab::Social => social,
+                    Tab::Updates => updates,
+                    Tab::Primary => !promotions && !social && !updates,
+                }
+            }
+            Kind::Starred => has(STARRED) && !trash,
+            Kind::Sent => has(SENT) && !trash,
+            Kind::Drafts => has(DRAFT) && !trash,
+            Kind::Spam => spam,
+            Kind::Trash => trash,
+            Kind::Label => has(WANTED) && !trash,
+            Kind::Nothing => false,
+        }
+    }
+
+    fn has(&self, messages: &[Lean]) -> bool {
+        messages.iter().any(|message| self.holds(message.flags))
+    }
+
+    fn has_unread(&self, messages: &[Lean]) -> bool {
+        messages
+            .iter()
+            .any(|message| message.flags & UNREAD != 0 && self.holds(message.flags))
+    }
+}
+
+/// One row of the list, before its text is read.
+struct Line {
+    conversation: usize,
+    latest: Lean,
+    unread: bool,
+    starred: bool,
+    attachments: bool,
+    count: i64,
+}
+
+/// The conversations that `keep` lets through, each summed up over the messages `shows`
+/// picks, newest first. A conversation with no such message is left out.
+fn summarize(loaded: &Loaded, keep: impl Fn(usize) -> bool, shows: impl Fn(&Lean) -> bool) -> Vec<Line> {
+    let conversations = &loaded.conversations;
+    let mut lines = Vec::new();
+    for (place, conversation) in conversations.iter().enumerate() {
+        if !keep(place) {
+            continue;
+        }
+        let mut line: Option<Line> = None;
+        for message in loaded.messages_of(conversation).iter().filter(|message| shows(message)) {
+            let line = line.get_or_insert(Line {
+                conversation: place,
+                latest: *message,
+                unread: false,
+                starred: false,
+                attachments: false,
+                count: 0,
+            });
+            if (message.date, message.rowid) > (line.latest.date, line.latest.rowid) {
+                line.latest = *message;
+            }
+            line.unread |= message.flags & UNREAD != 0;
+            line.starred |= message.flags & STARRED != 0;
+            line.attachments |= message.flags & ATTACHMENT != 0;
+            line.count += 1;
+        }
+        lines.extend(line);
+    }
+    lines.sort_by(|a, b| {
+        b.latest
+            .date
+            .cmp(&a.latest.date)
+            .then_with(|| conversations[b.conversation].thread_id.cmp(&conversations[a.conversation].thread_id))
+    });
+    lines
+}
+
+/// Reads what a row shows (sender, subject, preview) for the lines of one page. In a
+/// message's row the labels sit after the body, and reading past a long body is slow, so
+/// the labels come from the index instead.
+fn hydrate(conn: &Connection, accounts: &[Owner], conversations: &[Conversation], lines: &[&Line]) -> Result<Vec<ThreadSummary>, String> {
     let mut stmt = conn
-        .prepare_cached(&format!("{HEADER_COLUMNS} WHERE account_id = ?1 AND thread_id = ?2"))
+        .prepare_cached("SELECT id, from_name, from_email, subject, snippet FROM messages WHERE rowid = ?1")
         .map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map(params![account_id, thread_id], read_header)
+    const LABELS: &str = "WHERE account_id = ?1 AND thread_id = ?2 AND id = ?3";
+    // Naming the index keeps SQLite from going through the table. Until an older mailbox
+    // has the index, the plain form is the one that works.
+    let mut labels = conn
+        .prepare_cached(&format!("SELECT label_ids FROM messages INDEXED BY idx_messages_sort {LABELS}"))
+        .or_else(|_| conn.prepare_cached(&format!("SELECT label_ids FROM messages {LABELS}")))
         .map_err(|e| e.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    let mut threads = Vec::with_capacity(lines.len());
+    for line in lines {
+        let conversation = &conversations[line.conversation];
+        let account = &accounts[conversation.account];
+        let mut thread = stmt
+            .query_row([line.latest.rowid], |row| {
+                Ok(ThreadSummary {
+                    account_id: account.id.clone(),
+                    account_email: account.email.clone(),
+                    account_color: account.color.clone(),
+                    thread_id: conversation.thread_id.clone(),
+                    latest_message_id: row.get(0)?,
+                    from_name: row.get(1)?,
+                    from_email: row.get(2)?,
+                    subject: row.get(3)?,
+                    snippet: row.get(4)?,
+                    date: line.latest.date,
+                    unread: line.unread,
+                    starred: line.starred,
+                    has_attachments: line.attachments,
+                    message_count: line.count,
+                    label_ids: Vec::new(),
+                    snooze_until: None,
+                    scheduled_id: None,
+                    body_html: None,
+                    preview_to: None,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        thread.label_ids = labels
+            .query_row(params![account.id, conversation.thread_id, thread.latest_message_id], |row| row.get::<_, String>(0))
+            .map(|json| json_vec(&json))
+            .map_err(|e| e.to_string())?;
+        threads.push(thread);
+    }
+    Ok(threads)
+}
+
+/// The rows of the messages a search finds: by the full-text index, or if that cannot run
+/// the search, by looking for the text in senders, subjects and previews.
+fn matched_rows(conn: &Connection, search: &str, account_id: &str, group: Option<&[String]>) -> Result<HashSet<i64>, String> {
+    let mut rows = HashSet::new();
+    match scoped_fts_ids(conn, search, account_id, group)? {
+        Some(found) => {
+            let mut stmt = conn
+                .prepare_cached("SELECT rowid FROM messages WHERE account_id = ?1 AND id = ?2")
+                .map_err(|e| e.to_string())?;
+            for (account_id, message_id) in found {
+                if let Ok(rowid) = stmt.query_row(params![account_id, message_id], |row| row.get(0)) {
+                    rows.insert(rowid);
+                }
+            }
+        }
+        None => {
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT rowid FROM messages WHERE instr(lower(subject), ?1) > 0 OR instr(lower(snippet), ?1) > 0
+                     OR instr(lower(from_email), ?1) > 0 OR instr(lower(from_name), ?1) > 0",
+                )
+                .map_err(|e| e.to_string())?;
+            let found = stmt
+                .query_map([search.to_lowercase()], |row| row.get(0))
+                .map_err(|e| e.to_string())?;
+            for rowid in found {
+                rows.insert(rowid.map_err(|e| e.to_string())?);
+            }
+        }
+    }
+    Ok(rows)
+}
+
+fn count_folders(loaded: &Loaded, tabs: &InboxTabs) -> FolderCounts {
+    let mut counts = FolderCounts {
+        inbox: 0,
+        inbox_unread: 0,
+        starred: 0,
+        drafts: 0,
+        primary_unread: 0,
+        promotions_unread: 0,
+        social_unread: 0,
+        updates_unread: 0,
+        spam_unread: 0,
+        snoozed: 0,
+        scheduled: 0,
+    };
+    let inbox = View::new("inbox", None, tabs);
+    let starred = View::new("starred", None, tabs);
+    let drafts = View::new("drafts", None, tabs);
+    let spam = View::new("spam", None, tabs);
+    let promotions = View::new("inbox", Some("promotions"), tabs);
+    let social = View::new("inbox", Some("social"), tabs);
+    let updates = View::new("inbox", Some("updates"), tabs);
+    for conversation in &loaded.conversations {
+        let conversation = loaded.messages_of(conversation);
+        if inbox.has(conversation) {
+            counts.inbox += 1;
+            // The inbox with no category is its Primary tab, so the two unread counts agree.
+            if inbox.has_unread(conversation) {
+                counts.inbox_unread += 1;
+                counts.primary_unread += 1;
+            }
+        }
+        if starred.has(conversation) {
+            counts.starred += 1;
+        }
+        if drafts.has(conversation) {
+            counts.drafts += 1;
+        }
+        if promotions.has_unread(conversation) {
+            counts.promotions_unread += 1;
+        }
+        if social.has_unread(conversation) {
+            counts.social_unread += 1;
+        }
+        if updates.has_unread(conversation) {
+            counts.updates_unread += 1;
+        }
+        if spam.has_unread(conversation) {
+            counts.spam_unread += 1;
+        }
+    }
+    counts
 }
 
 fn lookup_thread(conn: &Connection, account_id: &str, message_id: &str) -> Result<Option<String>, String> {
@@ -1202,33 +1655,6 @@ fn fts_query(input: &str) -> String {
         .join(" ")
 }
 
-fn like_ids(headers: &[Header], needle: &str) -> HashSet<(String, String)> {
-    let needle = needle.to_lowercase();
-    headers
-        .iter()
-        .filter(|header| {
-            header.subject.to_lowercase().contains(&needle)
-                || header.snippet.to_lowercase().contains(&needle)
-                || header.from_email.to_lowercase().contains(&needle)
-                || header.from_name.to_lowercase().contains(&needle)
-        })
-        .map(|header| (header.account_id.clone(), header.id.clone()))
-        .collect()
-}
-
-/// Sorts messages into conversations. Takes the headers rather than copying them: a large
-/// mailbox has tens of thousands, and this runs for every refresh of the list.
-fn group_headers(headers: Vec<Header>) -> HashMap<(String, String), Vec<Header>> {
-    let mut groups: HashMap<(String, String), Vec<Header>> = HashMap::new();
-    for header in headers {
-        groups
-            .entry((header.account_id.clone(), header.thread_id.clone()))
-            .or_default()
-            .push(header);
-    }
-    groups
-}
-
 fn account_pairs(accounts: &[Account]) -> HashMap<String, (String, String)> {
     accounts
         .iter()
@@ -1287,147 +1713,6 @@ fn html_plain(html: &str) -> String {
         }
     }
     out.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn summarize(
-    groups: HashMap<(String, String), Vec<Header>>,
-    accounts: &HashMap<String, (String, String)>,
-    folder: &str,
-    label_id: Option<&str>,
-    category: Option<&str>,
-    tabs: &InboxTabs,
-) -> Vec<ThreadSummary> {
-    let mut threads = Vec::new();
-    for ((account_id, thread_id), messages) in groups {
-        let matching: Vec<&Header> = messages
-            .iter()
-            .filter(|message| message_in_folder(&message.label_ids, folder, label_id, category, tabs))
-            .collect();
-        if matching.is_empty() {
-            continue;
-        }
-        let latest = matching
-            .iter()
-            .max_by_key(|message| (message.date, message.id.as_str()))
-            .expect("matching is non-empty");
-        let (email, color) = accounts
-            .get(&account_id)
-            .cloned()
-            .unwrap_or_else(|| (String::new(), "#888888".into()));
-        threads.push(ThreadSummary {
-            account_id,
-            account_email: email,
-            account_color: color,
-            thread_id,
-            latest_message_id: latest.id.clone(),
-            from_name: latest.from_name.clone(),
-            from_email: latest.from_email.clone(),
-            subject: latest.subject.clone(),
-            snippet: latest.snippet.clone(),
-            date: latest.date,
-            unread: matching.iter().any(|message| has_label(&message.label_ids, "UNREAD")),
-            starred: matching.iter().any(|message| has_label(&message.label_ids, "STARRED")),
-            has_attachments: matching.iter().any(|message| message.has_attachments),
-            message_count: matching.len() as i64,
-            label_ids: latest.label_ids.clone(),
-            snooze_until: None,
-            scheduled_id: None,
-            body_html: None,
-            preview_to: None,
-        });
-    }
-    threads.sort_by(|a, b| b.date.cmp(&a.date).then(b.thread_id.cmp(&a.thread_id)));
-    threads
-}
-
-fn counts_from(groups: &HashMap<(String, String), Vec<Header>>, tabs: &InboxTabs) -> FolderCounts {
-    let mut counts = FolderCounts {
-        inbox: 0,
-        inbox_unread: 0,
-        starred: 0,
-        drafts: 0,
-        primary_unread: 0,
-        promotions_unread: 0,
-        social_unread: 0,
-        updates_unread: 0,
-        spam_unread: 0,
-        snoozed: 0,
-        scheduled: 0,
-    };
-    for messages in groups.values() {
-        if thread_in(messages, "inbox", None, None, tabs) {
-            counts.inbox += 1;
-            if unread_in(messages, "inbox", None, None, tabs) {
-                counts.inbox_unread += 1;
-            }
-        }
-        if thread_in(messages, "starred", None, None, tabs) {
-            counts.starred += 1;
-        }
-        if thread_in(messages, "drafts", None, None, tabs) {
-            counts.drafts += 1;
-        }
-        if unread_in(messages, "inbox", None, Some("primary"), tabs) {
-            counts.primary_unread += 1;
-        }
-        if unread_in(messages, "inbox", None, Some("promotions"), tabs) {
-            counts.promotions_unread += 1;
-        }
-        if unread_in(messages, "inbox", None, Some("social"), tabs) {
-            counts.social_unread += 1;
-        }
-        if unread_in(messages, "inbox", None, Some("updates"), tabs) {
-            counts.updates_unread += 1;
-        }
-        if unread_in(messages, "spam", None, None, tabs) {
-            counts.spam_unread += 1;
-        }
-    }
-    counts
-}
-
-fn thread_in(messages: &[Header], folder: &str, label_id: Option<&str>, category: Option<&str>, tabs: &InboxTabs) -> bool {
-    messages
-        .iter()
-        .any(|message| message_in_folder(&message.label_ids, folder, label_id, category, tabs))
-}
-
-fn unread_in(messages: &[Header], folder: &str, label_id: Option<&str>, category: Option<&str>, tabs: &InboxTabs) -> bool {
-    messages.iter().any(|message| {
-        has_label(&message.label_ids, "UNREAD") && message_in_folder(&message.label_ids, folder, label_id, category, tabs)
-    })
-}
-
-fn message_in_folder(labels: &[String], folder: &str, label_id: Option<&str>, category: Option<&str>, tabs: &InboxTabs) -> bool {
-    let trash = has_label(labels, "TRASH");
-    let spam = has_label(labels, "SPAM");
-    match folder {
-        "all" => true,
-        "inbox" => {
-            if !has_label(labels, "INBOX") || trash || spam {
-                return false;
-            }
-            // Gmail keeps a category in Primary until that inbox tab is turned on.
-            // Updates is off by default, so CATEGORY_UPDATES mail stays in Primary.
-            let promotions = tabs.promotions && has_label(labels, "CATEGORY_PROMOTIONS");
-            let social = tabs.social && (has_label(labels, "CATEGORY_SOCIAL") || has_label(labels, "CATEGORY_FORUMS"));
-            let updates = tabs.updates && has_label(labels, "CATEGORY_UPDATES");
-            match category.unwrap_or("primary") {
-                "all" => true,
-                "promotions" => promotions,
-                "social" => social,
-                "updates" => updates,
-                _ => !promotions && !social && !updates,
-            }
-        }
-        "starred" => has_label(labels, "STARRED") && !trash,
-        "sent" => has_label(labels, "SENT") && !trash,
-        "drafts" => has_label(labels, "DRAFT") && !trash,
-        "spam" => spam,
-        "trash" => trash,
-        "label" => label_id.map(|id| has_label(labels, id)).unwrap_or(false) && !trash,
-        _ => false,
-    }
 }
 
 fn has_label(labels: &[String], id: &str) -> bool {
@@ -1549,6 +1834,11 @@ mod tests {
         let started = std::time::Instant::now();
         let conn = open(Path::new(&path)).unwrap();
         println!("open and migrate: {} ms", started.elapsed().as_millis());
+        if needs_list_indexes(&conn) {
+            let started = std::time::Instant::now();
+            build_list_indexes(&conn).unwrap();
+            println!("build list indexes: {} ms", started.elapsed().as_millis());
+        }
         let accounts = list_accounts(&conn).unwrap();
         let largest = accounts
             .iter()
