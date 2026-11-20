@@ -8,6 +8,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use crate::db;
 use crate::files;
 use crate::gmail;
+use crate::imap;
 use crate::model::{Account, SyncProgress};
 use crate::parse;
 use crate::AppState;
@@ -41,7 +42,8 @@ pub async fn sync_all(app: &AppHandle) -> Result<(), String> {
     result
 }
 
-/// Cheap new-mail check: only the Gmail history call, with no labels, backfill or spam/trash.
+/// Cheap new-mail check: only the Gmail history call (or a look at an IMAP inbox), with no
+/// labels, backfill or spam/trash.
 /// Runs often; accounts already mid-sync are skipped since that sync reads history itself.
 pub async fn check_new_mail(app: &AppHandle) {
     let accounts = {
@@ -57,7 +59,11 @@ pub async fn check_new_mail(app: &AppHandle) {
                 return None;
             }
             let started = Instant::now();
-            let result = history_sync(app, &account).await;
+            let result = if imap::handles(&account.provider) {
+                imap::check(app, &account.id).await
+            } else {
+                history_sync(app, &account).await
+            };
             let elapsed = started.elapsed().as_millis() as u64;
             end(app, &account.id);
             if let Ok(true) = result {
@@ -68,7 +74,7 @@ pub async fn check_new_mail(app: &AppHandle) {
                 );
                 crate::refresh_badge(app);
             }
-            // With no changes the check was a single history call, so its time is the round trip to Gmail.
+            // With no changes the check was a single short exchange, so its time is the round trip to the mail service.
             Some(result.map(|changed| (!changed).then_some(elapsed)))
         });
     let probes: Vec<_> = join_all(checks).await.into_iter().flatten().collect();
@@ -115,6 +121,9 @@ pub async fn sync_account(app: &AppHandle, account_id: &str, eager: bool) -> Res
 async fn sync_inner(app: &AppHandle, account_id: &str, eager: bool) -> Result<(), String> {
     let mut account = with_db(app, |conn| db::get_account(conn, account_id))?;
     emit(app, &account.email, "Checking for new mail", 0);
+    if imap::handles(&account.provider) {
+        return imap::sync(app, account_id, eager).await;
+    }
     // New mail first, so its notification does not wait on the slower steps below.
     if account.initial_done {
         history_sync(app, &account).await?;
@@ -427,7 +436,7 @@ fn entry_message_id(entry: &Value) -> Option<String> {
     entry.get("message")?.get("id")?.as_str().map(|id| id.to_string())
 }
 
-fn notify_new_mail(app: &AppHandle, account: &Account, fresh: &[String]) {
+pub(crate) fn notify_new_mail(app: &AppHandle, account: &Account, fresh: &[String]) {
     let thread = with_db(app, |conn| {
         let thread_id = lookup_or_empty(conn, &account.id, &fresh[0])?;
         db::get_thread(conn, &account.id, &thread_id)

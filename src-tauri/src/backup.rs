@@ -1,5 +1,5 @@
 //! Password-protected backup of account sign-ins, so a new install can pick up the same
-//! Gmail accounts without going through Google sign-in again.
+//! accounts without signing in to each one again.
 //!
 //! The file is JSON: a small header plus the account list encrypted with AES-256-GCM under
 //! a key derived from the password with Argon2id. Mail itself is not included; it syncs again.
@@ -18,6 +18,7 @@ use tauri::{AppHandle, Manager};
 use crate::auth;
 use crate::commands::{register_account, with_db};
 use crate::db;
+use crate::imap;
 use crate::model::{Account, SendAs};
 use crate::secrets;
 use crate::AppState;
@@ -67,7 +68,11 @@ struct BackupAccount {
     color: String,
     signature: String,
     send_as: Vec<SendAs>,
+    /// The account's secret: a Google refresh token, or the password of an IMAP account.
     refresh_token: String,
+    /// Missing in backups made before other mail services were supported; those are all Gmail.
+    #[serde(default = "crate::model::default_provider")]
+    provider: String,
 }
 
 #[derive(Serialize)]
@@ -182,6 +187,7 @@ pub async fn backup_export(app: AppHandle, path: String, password: String) -> Re
                     signature: account.signature,
                     send_as: account.send_as,
                     refresh_token,
+                    provider: account.provider,
                 });
             }
             Err(_) => skipped.push(account.email),
@@ -201,49 +207,40 @@ pub async fn backup_export(app: AppHandle, path: String, password: String) -> Re
 
 #[tauri::command]
 pub async fn backup_import(app: AppHandle, path: String, password: String) -> Result<Vec<ImportItem>, String> {
-    if auth::CLIENT_ID.is_empty() {
-        return Err(auth::MISSING_CLIENT.into());
-    }
     let text = std::fs::read_to_string(&path).map_err(|e| format!("Could not open the backup: {e}"))?;
     let envelope: Envelope = serde_json::from_str(&text).map_err(|_| "This is not a Novabox sign-in backup.".to_string())?;
     let payload = tauri::async_runtime::spawn_blocking(move || decrypt(&envelope, &password))
         .await
         .map_err(|e| e.to_string())??;
-    if payload.client != client_fingerprint() {
-        return Err("This backup was made with a different Google client ID, so its sign-ins can't be used with this copy of Novabox. Sign in with Google instead.".into());
-    }
-    let http = app.state::<AppState>().http.clone();
+    let same_client = payload.client == client_fingerprint();
     let mut report = Vec::new();
     for item in payload.accounts {
-        // Prove the sign-in still works before keeping it; Google may have revoked it.
-        let session = match auth::refresh_access(&http, auth::CLIENT_ID, auth::CLIENT_SECRET, &item.refresh_token).await {
-            Ok(session) => session,
-            Err(err) => {
-                // token_request prefixes Google's own refusals (invalid_grant and the like);
-                // anything else is the network or a Google hiccup, and the backup is still good.
-                let message = if err.starts_with("Google sign-in failed") {
-                    format!("Google no longer accepts this sign-in ({err}). Sign in again with the + button.")
-                } else {
-                    format!("Couldn't check this sign-in with Google ({err}). Check your connection and import the backup again.")
-                };
-                report.push(ImportItem { email: item.email, status: "failed".into(), message: Some(message) });
+        let email = item.email.clone();
+        // Prove the sign-in still works before keeping it; it may have been revoked or changed.
+        let checked = if imap::handles(&item.provider) {
+            check_password(&app, &item).await
+        } else {
+            check_google(&app, &item, same_client).await
+        };
+        let secret = match checked {
+            Ok(secret) => secret,
+            Err(message) => {
+                report.push(ImportItem { email, status: "failed".into(), message: Some(message) });
                 continue;
             }
         };
         let existed = with_db(&app, |conn| Ok(db::get_account(conn, &item.id).is_ok()))?;
         let id = item.id.clone();
-        let refresh = session.refresh_token.clone();
-        let saved = tauri::async_runtime::spawn_blocking(move || secrets::save(&id, &refresh))
+        let saved = tauri::async_runtime::spawn_blocking(move || secrets::save(&id, &secret))
             .await
             .map_err(|e| e.to_string())?;
         if let Err(err) = saved {
-            report.push(ImportItem { email: item.email, status: "failed".into(), message: Some(err) });
+            report.push(ImportItem { email, status: "failed".into(), message: Some(err) });
             continue;
         }
-        auth::store_token(&app, &item.id, &session);
         let account = Account {
             id: item.id,
-            email: item.email.clone(),
+            email: item.email,
             name: item.name,
             picture: item.picture,
             color: item.color,
@@ -255,18 +252,55 @@ pub async fn backup_import(app: AppHandle, path: String, password: String) -> Re
             backfill_token: None,
             backfill_done: false,
             initial_done: false,
+            provider: item.provider,
         };
         match register_account(&app, account).await {
             Ok(_) => report.push(ImportItem {
-                email: item.email,
+                email,
                 status: if existed { "updated".into() } else { "added".into() },
                 message: None,
             }),
-            Err(err) => report.push(ImportItem { email: item.email, status: "failed".into(), message: Some(err) }),
+            Err(err) => report.push(ImportItem { email, status: "failed".into(), message: Some(err) }),
         }
     }
     crate::refresh_badge(&app);
     Ok(report)
+}
+
+/// Checks a Google sign-in from a backup and returns the refresh token to keep.
+async fn check_google(app: &AppHandle, item: &BackupAccount, same_client: bool) -> Result<String, String> {
+    if auth::CLIENT_ID.is_empty() {
+        return Err(auth::MISSING_CLIENT.into());
+    }
+    if !same_client {
+        return Err("This backup was made with a different Google client ID, so this sign-in can't be used with this copy of Novabox. Sign in with Google instead.".into());
+    }
+    let http = app.state::<AppState>().http.clone();
+    match auth::refresh_access(&http, auth::CLIENT_ID, auth::CLIENT_SECRET, &item.refresh_token).await {
+        Ok(session) => {
+            auth::store_token(app, &item.id, &session);
+            Ok(session.refresh_token)
+        }
+        // token_request prefixes Google's own refusals (invalid_grant and the like);
+        // anything else is the network or a Google hiccup, and the backup is still good.
+        Err(err) if err.starts_with("Google sign-in failed") => Err(format!(
+            "Google no longer accepts this sign-in ({err}). Sign in again with the + button."
+        )),
+        Err(err) => Err(format!(
+            "Couldn't check this sign-in with Google ({err}). Check your connection and import the backup again."
+        )),
+    }
+}
+
+/// Checks a saved password by signing in with it, and returns it to keep.
+async fn check_password(app: &AppHandle, item: &BackupAccount) -> Result<String, String> {
+    match imap::sign_in(app, &item.provider, &item.email, &item.refresh_token).await {
+        Ok(_) => Ok(item.refresh_token.clone()),
+        Err(err) if err.starts_with("Could not reach") => Err(format!(
+            "{err}. Check your connection and import the backup again."
+        )),
+        Err(err) => Err(format!("{err} Add the account again with the + button.")),
+    }
 }
 
 #[cfg(test)]
@@ -286,6 +320,7 @@ mod tests {
                 signature: String::new(),
                 send_as: Vec::new(),
                 refresh_token: "secret-token".into(),
+                provider: "gmail".into(),
             }],
         }
     }

@@ -1,7 +1,7 @@
 //! Mail actions take effect on this PC at once, so the window never waits on the network.
-//! Gmail is told afterwards, one change at a time in the order they were made, so an
-//! action and its undo can't reach Gmail the wrong way round. A change Gmail refuses is
-//! rolled back here and reported with a `mail://action-failed` event.
+//! The mail service is told afterwards, one change at a time in the order they were made, so
+//! an action and its undo can't reach it the wrong way round. A change it refuses is rolled
+//! back here and reported with a `mail://action-failed` event.
 
 use serde_json::json;
 use tauri::{AppHandle, Emitter, Manager};
@@ -48,7 +48,8 @@ async fn run(app: &AppHandle, job: Job) {
             Err(err) if err.starts_with("gmail_404") => {}
             Err(err) => {
                 let _ = with_db(app, |conn| db::restore_labels(conn, &target.account_id, &before));
-                fail(app, &format!("Gmail didn't accept that change, so it was undone. {err}"));
+                let service = if crate::imap::uses(app, &target.account_id) { "The mail server" } else { "Gmail" };
+                fail(app, &format!("{service} didn't accept that change, so it was undone. {err}"));
             }
         },
     }

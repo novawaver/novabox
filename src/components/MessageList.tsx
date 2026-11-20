@@ -2,7 +2,7 @@ import { formatListDate, personName, threadKey } from "../format";
 import { IconArchive, IconBack, IconNext, IconPaperclip, IconRefresh, IconStar, IconTrash } from "./Icons";
 import { WhenMenu } from "./WhenMenu";
 import { useMail } from "../state/MailProvider";
-import { defaultInboxTabs, type Category, type InboxTabs } from "../types";
+import { defaultInboxTabs, isGoogle, type Category, type InboxTabs } from "../types";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useDismiss } from "../useDismiss";
 
@@ -48,6 +48,8 @@ export function MessageList({ className = "" }: { className?: string }) {
   const labelAccount = accountIds.size === 1 ? [...accountIds][0] : mail.query.accountId;
   const labelChoices = mail.labels.filter((label) => label.kind === "user" && (!labelAccount || label.accountId === labelAccount));
   const inTrash = mail.query.folder === "trash";
+  // Only Gmail empties Trash on a schedule Novabox knows; other services set their own.
+  const trashExpires = mail.accounts.some((account) => isGoogle(account) && (!mail.query.accountId || account.id === mail.query.accountId));
   const pageStart = mail.threads.length > 0 ? mail.query.offset + 1 : 0;
   const pageEnd = mail.query.offset + mail.threads.length;
   return (
@@ -124,7 +126,7 @@ export function MessageList({ className = "" }: { className?: string }) {
           </div>
         )}
       </div>
-      {inTrash && (
+      {inTrash && trashExpires && (
         <p className="border-b border-line px-4 py-2 text-xs text-muted">Gmail deletes conversations in Trash for good after 30 days.</p>
       )}
       <div className="min-h-0 flex-1 overflow-y-auto">

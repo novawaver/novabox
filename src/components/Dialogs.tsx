@@ -141,7 +141,7 @@ export function SettingsDialog() {
             <>
               <Section title="Accounts">
                 <p className="text-sm leading-6 text-muted">
-                  Back up your Google sign-ins to an encrypted file, then import it on another PC to use the same accounts there without signing in again.
+                  Back up your sign-ins to an encrypted file, then import it on another PC to use the same accounts there without signing in again.
                 </p>
                 <div className="flex flex-wrap gap-2">
                   <button type="button" className="rounded-full border border-line px-3 py-1.5 text-sm hover:bg-hover disabled:opacity-50" disabled={mail.accounts.length === 0 || mail.mode !== "live"} onClick={() => setBackup("export")}>
@@ -167,7 +167,7 @@ export function SettingsDialog() {
           {tab === "privacy" && (
             <Section title="Privacy">
               <p className="text-sm leading-6 text-muted">
-                Novabox uses Gmail data only to show and send your mail. It does not sell it, advertise with it, or use it to train models. Remote images in messages stay blocked until you show them. Closing the window leaves Novabox in the tray so new mail can arrive. Quit from the tray icon.
+                Novabox uses your mail only to show and send it. It does not sell it, advertise with it, or use it to train models. Remote images in messages stay blocked until you show them. Closing the window leaves Novabox in the tray so new mail can arrive. Quit from the tray icon.
               </p>
             </Section>
           )}

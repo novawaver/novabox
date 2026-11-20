@@ -65,7 +65,7 @@ export function AboutSection() {
         <p className="text-sm">
           Novabox {desktop ? mail.appVersion || "" : "browser preview"}
         </p>
-        <p className="text-sm leading-6 text-muted">A Windows mail app for several Gmail accounts in one window. Mail stays on this PC.</p>
+        <p className="text-sm leading-6 text-muted">A Windows mail app for several Gmail and Private Email accounts in one window. Mail stays on this PC.</p>
       </section>
       <section className="mt-6 space-y-2">
         <h3 className="text-sm font-semibold uppercase tracking-wide text-muted">Updates</h3>

@@ -10,7 +10,7 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-/** Export or import a password-protected backup of the accounts' Google sign-ins. */
+/** Export or import a password-protected backup of the accounts' sign-ins. */
 export function BackupDialog({ mode, onClose }: { mode: "export" | "import"; onClose: () => void }) {
   const mail = useMail();
   const [path, setPath] = useState("");
@@ -101,11 +101,11 @@ export function BackupDialog({ mode, onClose }: { mode: "export" | "import"; onC
           <p className="leading-6 text-muted">
             {exporting
               ? "Saves every signed-in account to one encrypted file. Import it on another PC to use the accounts there without signing in again. Mail is not included; it downloads again."
-              : "Restores the accounts saved in a Novabox backup file. Each sign-in is checked with Google first."}
+              : "Restores the accounts saved in a Novabox backup file. Each sign-in is checked before it is kept."}
           </p>
           {exporting && (
             <p className="rounded-xl bg-selected p-3 leading-6">
-              Anyone with this file and its password can read and send your mail. Keep it somewhere safe, and use a password you don't use elsewhere.
+              Anyone with this file and its password can read and send your mail. For a Private Email account the file holds the mailbox password itself. Keep it somewhere safe, and use a password you don't use elsewhere.
             </p>
           )}
           <div className="flex items-center gap-2">
@@ -130,7 +130,7 @@ export function BackupDialog({ mode, onClose }: { mode: "export" | "import"; onC
           <div className="flex justify-end gap-2 pt-1">
             <button type="button" className="rounded-full px-4 py-2 disabled:opacity-50" disabled={busy} onClick={close}>Cancel</button>
             <button type="submit" className="rounded-full bg-accent px-4 py-2 font-semibold text-white disabled:opacity-50" disabled={!ready}>
-              {busy ? (exporting ? "Encrypting…" : "Checking with Google…") : exporting ? "Export" : "Import"}
+              {busy ? (exporting ? "Encrypting…" : "Checking sign-ins…") : exporting ? "Export" : "Import"}
             </button>
           </div>
         </form>

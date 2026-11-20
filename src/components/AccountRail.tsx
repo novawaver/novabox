@@ -2,10 +2,11 @@ import { useEffect, useLayoutEffect, useRef, useState, type DragEvent, type HTML
 import { newId } from "../demo";
 import { initials } from "../format";
 import { addGroup, applyDrop, canStep, dropSlot, moveAccount, moveStep, normalizeRail, patchGroup, railEntries, railWidth, type RailItem, type RailSlot, type RailTarget } from "../rail";
+import { AddAccountDialog } from "./AddAccountDialog";
 import { Overlay } from "./Dialogs";
 import { IconBack, IconNext, IconPlus, IconX } from "./Icons";
 import { useMail } from "../state/MailProvider";
-import type { Account, AccountGroup } from "../types";
+import { isGoogle, type Account, type AccountGroup } from "../types";
 
 const GROUP_COLOR = "#6b5b47";
 
@@ -18,7 +19,7 @@ type DropState = { rowId: string; edge: DropEdge; slot: RailSlot };
 export function AccountRail() {
   const mail = useMail();
   const [menu, setMenu] = useState<MenuState | null>(null);
-  const [confirmSignIn, setConfirmSignIn] = useState(false);
+  const [adding, setAdding] = useState(false);
   const [naming, setNaming] = useState<Naming | null>(null);
   const [drag, setDrag] = useState<RailItem | null>(null);
   const [drop, setDrop] = useState<DropState | null>(null);
@@ -174,9 +175,9 @@ export function AccountRail() {
         </button>
         <button
           type="button"
-          title={mail.signInBusy ? "Cancel Google sign-in" : "Add Gmail account"}
-          aria-label={mail.signInBusy ? "Cancel Google sign-in" : "Add Gmail account"}
-          onClick={() => (mail.signInBusy ? mail.cancelSignIn() : setConfirmSignIn(true))}
+          title={mail.signInBusy ? "Cancel Google sign-in" : "Add account"}
+          aria-label={mail.signInBusy ? "Cancel Google sign-in" : "Add account"}
+          onClick={() => (mail.signInBusy ? mail.cancelSignIn() : setAdding(true))}
           className={`group relative grid h-11 w-11 shrink-0 place-items-center rounded-full border-2 transition-all duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-rail ${
             mail.signInBusy
               ? "border-danger/60 bg-panel text-danger hover:bg-danger hover:text-white"
@@ -223,25 +224,7 @@ export function AccountRail() {
           }}
         />
       )}
-      {confirmSignIn && (
-        <Overlay title="Add Gmail account" onClose={() => setConfirmSignIn(false)}>
-          <p className="text-sm text-muted">Novabox will open Google sign-in in your browser. Come back to this window when you're done.</p>
-          <div className="mt-5 flex justify-end gap-2">
-            <button type="button" className="rounded-full px-4 py-2" onClick={() => setConfirmSignIn(false)}>Cancel</button>
-            <button
-              type="button"
-              autoFocus
-              className="rounded-full bg-accent px-4 py-2 font-semibold text-accent-ink"
-              onClick={() => {
-                setConfirmSignIn(false);
-                void mail.signIn();
-              }}
-            >
-              Continue to browser
-            </button>
-          </div>
-        </Overlay>
-      )}
+      {adding && <AddAccountDialog onClose={() => setAdding(false)} />}
     </aside>
   );
 }
@@ -386,10 +369,17 @@ function AccountMenu({ account, x, y, keyboard, onClose, onNewGroup }: MenuPlace
       )}
       <MenuItem onClick={run(() => onNewGroup(account.id))}>New group…</MenuItem>
       <div className="my-1 h-px bg-line" />
-      <MenuItem onClick={run(() => void mail.removeAccount(account.id, false))}>Remove from this PC…</MenuItem>
-      <MenuItem danger onClick={run(() => void mail.removeAccount(account.id, true))}>
-        Sign out…
-      </MenuItem>
+      {/* Signing out revokes Google's access everywhere. A password account has nothing to revoke. */}
+      {isGoogle(account) ? (
+        <>
+          <MenuItem onClick={run(() => void mail.removeAccount(account.id, false))}>Remove from this PC…</MenuItem>
+          <MenuItem danger onClick={run(() => void mail.removeAccount(account.id, true))}>
+            Sign out…
+          </MenuItem>
+        </>
+      ) : (
+        <MenuItem danger onClick={run(() => void mail.removeAccount(account.id, false))}>Remove from this PC…</MenuItem>
+      )}
     </RailMenu>
   );
 }

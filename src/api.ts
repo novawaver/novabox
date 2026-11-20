@@ -56,6 +56,10 @@ export const api = {
     assertDesktop();
     return invoke<Account>("sign_in");
   },
+  signInPassword: async (provider: string, email: string, password: string, name: string) => {
+    assertDesktop();
+    return invoke<Account>("sign_in_password", { request: { provider, email, password, name } });
+  },
   signInCancel: () => invoke<void>("sign_in_cancel"),
   accountRemove: (accountId: string, revoke = true) => invoke<void>("account_remove", { accountId, revoke }),
   backupExport: (path: string, password: string) => invoke<{ exported: string[]; skipped: string[] }>("backup_export", { path, password }),

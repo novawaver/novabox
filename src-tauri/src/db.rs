@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     backfill_token TEXT,
     backfill_done INTEGER NOT NULL DEFAULT 0,
     initial_done INTEGER NOT NULL DEFAULT 0,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    provider TEXT NOT NULL DEFAULT 'gmail'
 );
 CREATE TABLE IF NOT EXISTS messages (
     account_id TEXT NOT NULL,
@@ -62,6 +63,9 @@ CREATE TABLE IF NOT EXISTS labels (
 );
 CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(account_id, thread_id);
 CREATE INDEX IF NOT EXISTS idx_messages_date ON messages(account_id, date);
+CREATE INDEX IF NOT EXISTS idx_messages_header ON messages(account_id, message_id_header);
+CREATE INDEX IF NOT EXISTS idx_messages_list ON messages(account_id, id, thread_id, date, has_attachments, label_ids, from_name, from_email, subject, snippet);
+CREATE INDEX IF NOT EXISTS idx_messages_unread ON messages(account_id, thread_id, label_ids) WHERE instr(label_ids, '"UNREAD"') > 0 AND instr(label_ids, '"INBOX"') > 0;
 CREATE TABLE IF NOT EXISTS snoozes (
     account_id TEXT NOT NULL,
     thread_id TEXT NOT NULL,
@@ -99,6 +103,12 @@ pub fn open(path: &Path) -> Result<Connection, String> {
     }
     let conn = Connection::open(path).map_err(|e| format!("Could not open the local mailbox: {e}"))?;
     conn.pragma_update(None, "journal_mode", "WAL").ok();
+    // With the write-ahead log, NORMAL cannot corrupt the file; a power cut can only lose the
+    // last few writes, and mail downloads again. FULL waits on the disk for every message.
+    conn.pragma_update(None, "synchronous", "NORMAL").ok();
+    // 64 MB of pages kept in memory, enough to hold the list index of a large mailbox.
+    conn.pragma_update(None, "cache_size", -65_536).ok();
+    conn.pragma_update(None, "temp_store", "MEMORY").ok();
     conn.busy_timeout(Duration::from_secs(5)).map_err(|e| e.to_string())?;
     migrate(&conn)?;
     Ok(conn)
@@ -110,43 +120,75 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
         .unwrap_or(0);
     if version < 1 {
         conn.execute_batch(SCHEMA).map_err(|e| format!("Could not prepare the local mailbox: {e}"))?;
-        conn.pragma_update(None, "user_version", 1).map_err(|e| e.to_string())?;
-    } else if version < 2 {
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS snoozes (
-                account_id TEXT NOT NULL,
-                thread_id TEXT NOT NULL,
-                until_at INTEGER NOT NULL,
-                PRIMARY KEY (account_id, thread_id)
-            );
-            CREATE TABLE IF NOT EXISTS scheduled_mail (
-                id TEXT PRIMARY KEY,
-                account_id TEXT NOT NULL,
-                send_at INTEGER NOT NULL,
-                payload_json TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS templates (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                subject TEXT NOT NULL DEFAULT '',
-                html TEXT NOT NULL DEFAULT '',
-                updated_at INTEGER NOT NULL
-            );",
-        )
-        .map_err(|e| format!("Could not prepare snooze and templates: {e}"))?;
-        conn.pragma_update(None, "user_version", 2).map_err(|e| e.to_string())?;
+    } else {
+        if version < 2 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS snoozes (
+                    account_id TEXT NOT NULL,
+                    thread_id TEXT NOT NULL,
+                    until_at INTEGER NOT NULL,
+                    PRIMARY KEY (account_id, thread_id)
+                );
+                CREATE TABLE IF NOT EXISTS scheduled_mail (
+                    id TEXT PRIMARY KEY,
+                    account_id TEXT NOT NULL,
+                    send_at INTEGER NOT NULL,
+                    payload_json TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS templates (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    subject TEXT NOT NULL DEFAULT '',
+                    html TEXT NOT NULL DEFAULT '',
+                    updated_at INTEGER NOT NULL
+                );",
+            )
+            .map_err(|e| format!("Could not prepare snooze and templates: {e}"))?;
+        }
+        if version < 3 {
+            // Accounts from before other mail services were supported are all Gmail.
+            conn.execute_batch("ALTER TABLE accounts ADD COLUMN provider TEXT NOT NULL DEFAULT 'gmail';")
+                .map_err(|e| format!("Could not prepare the local mailbox for other mail services: {e}"))?;
+        }
+        if version < 4 {
+            // A message's row holds its whole body, so reading the list out of the table walks
+            // the entire file: seconds for a large mailbox, on every refresh. These two indexes
+            // hold only what the list and the unread counts need. Building them reads the
+            // table once, which is the one slow start after updating.
+            conn.execute_batch(LIST_INDEXES)
+                .map_err(|e| format!("Could not speed up the local mailbox: {e}"))?;
+        }
     }
-    if version < 1 {
-        conn.pragma_update(None, "user_version", 2).map_err(|e| e.to_string())?;
+    if version < 4 {
+        conn.pragma_update(None, "user_version", 4).map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+const LIST_INDEXES: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_messages_list ON messages(account_id, id, thread_id, date, has_attachments, label_ids, from_name, from_email, subject, snippet);
+CREATE INDEX IF NOT EXISTS idx_messages_unread ON messages(account_id, thread_id, label_ids) WHERE instr(label_ids, '"UNREAD"') > 0 AND instr(label_ids, '"INBOX"') > 0;
+"#;
+
+/// The index that finds a message by its Message-ID header, which ties IMAP mail into
+/// conversations. Only IMAP accounts need it, and building it reads every stored message,
+/// so a mailbox from before those accounts existed gets it when the first one syncs.
+pub fn ensure_header_index(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_messages_header ON messages(account_id, message_id_header);")
+        .map_err(|e| e.to_string())
+}
+
+/// Which mail service an account is with, without counting its unread mail.
+pub fn account_provider(conn: &Connection, id: &str) -> Result<String, String> {
+    conn.query_row("SELECT provider FROM accounts WHERE id = ?1", [id], |row| row.get(0))
+        .map_err(|_| "That account is not on this PC.".to_string())
 }
 
 pub fn upsert_account(conn: &Connection, account: &Account) -> Result<(), String> {
     let send_as = to_json(&account.send_as);
     conn.execute(
-        "INSERT INTO accounts (id, email, name, picture, color, signature, send_as_json, history_id, recent_page_token, backfill_token, backfill_done, initial_done, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+        "INSERT INTO accounts (id, email, name, picture, color, signature, send_as_json, history_id, recent_page_token, backfill_token, backfill_done, initial_done, created_at, provider)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
          ON CONFLICT(id) DO UPDATE SET
             email = excluded.email,
             name = excluded.name,
@@ -166,6 +208,7 @@ pub fn upsert_account(conn: &Connection, account: &Account) -> Result<(), String
             account.backfill_done as i64,
             account.initial_done as i64,
             crate::util::now_secs(),
+            account.provider,
         ],
     )
     .map_err(|e| e.to_string())?;
@@ -174,7 +217,7 @@ pub fn upsert_account(conn: &Connection, account: &Account) -> Result<(), String
 
 pub fn list_accounts(conn: &Connection) -> Result<Vec<Account>, String> {
     let mut stmt = conn
-        .prepare("SELECT id, email, name, picture, color, signature, send_as_json, history_id, recent_page_token, backfill_token, backfill_done, initial_done FROM accounts ORDER BY created_at")
+        .prepare("SELECT id, email, name, picture, color, signature, send_as_json, history_id, recent_page_token, backfill_token, backfill_done, initial_done, provider FROM accounts ORDER BY created_at")
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |row| Ok(read_account(row)?))
@@ -184,8 +227,9 @@ pub fn list_accounts(conn: &Connection) -> Result<Vec<Account>, String> {
         accounts.push(row.map_err(|e| e.to_string())?);
     }
     drop(stmt);
+    let unread = unread_counts(conn)?;
     for account in &mut accounts {
-        account.unread = unread_count(conn, &account.id)?;
+        account.unread = unread.get(&account.id).copied().unwrap_or(0);
     }
     Ok(accounts)
 }
@@ -193,7 +237,7 @@ pub fn list_accounts(conn: &Connection) -> Result<Vec<Account>, String> {
 pub fn get_account(conn: &Connection, id: &str) -> Result<Account, String> {
     let mut account = conn
         .query_row(
-            "SELECT id, email, name, picture, color, signature, send_as_json, history_id, recent_page_token, backfill_token, backfill_done, initial_done FROM accounts WHERE id = ?1",
+            "SELECT id, email, name, picture, color, signature, send_as_json, history_id, recent_page_token, backfill_token, backfill_done, initial_done, provider FROM accounts WHERE id = ?1",
             [id],
             |row| Ok(read_account(row)?),
         )
@@ -395,6 +439,52 @@ pub fn delete_message(conn: &Connection, account_id: &str, message_id: &str) -> 
     )
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// The stored messages whose id starts with `prefix`, each with its labels. An IMAP message's
+/// id starts with its folder's key, so this lists what is stored of one folder.
+pub fn messages_with_prefix(conn: &Connection, account_id: &str, prefix: &str) -> Result<Vec<(String, Vec<String>)>, String> {
+    // A range over the primary key, so one folder is read without walking the whole mailbox.
+    let mut stmt = conn
+        .prepare("SELECT id, label_ids FROM messages WHERE account_id = ?1 AND id >= ?2 AND id < ?3")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![account_id, prefix, format!("{prefix}\u{10FFFF}")], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows.into_iter().map(|(id, json)| (id, json_vec(&json))).collect())
+}
+
+/// The id and conversation of a stored message with this Message-ID header.
+pub fn message_by_header(conn: &Connection, account_id: &str, header: &str) -> Result<Option<(String, String)>, String> {
+    if header.is_empty() {
+        return Ok(None);
+    }
+    match conn.query_row(
+        "SELECT id, thread_id FROM messages WHERE account_id = ?1 AND message_id_header = ?2 ORDER BY date DESC LIMIT 1",
+        params![account_id, header],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ) {
+        Ok(found) => Ok(Some(found)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+/// Each message of a conversation: its id and who it is from.
+pub fn thread_senders(conn: &Connection, account_id: &str, thread_id: &str) -> Result<Vec<(String, String)>, String> {
+    let mut stmt = conn
+        .prepare("SELECT id, from_email FROM messages WHERE account_id = ?1 AND thread_id = ?2")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![account_id, thread_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows)
 }
 
 /// A stored message's labels, or `None` when the message is not on this PC.
@@ -748,7 +838,7 @@ pub fn query_mailbox(conn: &Connection, query: &ThreadQuery) -> Result<Mailbox, 
     let mut headers = load_headers(conn, &account_filter)?;
     headers.retain(|header| in_group(&header.account_id));
     let account_map = account_pairs(&accounts);
-    let groups = group_headers(&headers);
+    let groups = group_headers(headers);
     let mut snoozes = load_snoozes(conn, &account_filter)?;
     snoozes.retain(|(account_id, _), _| in_group(account_id));
     let mut scheduled = load_scheduled(conn, &account_filter)?;
@@ -781,22 +871,33 @@ pub fn query_mailbox(conn: &Connection, query: &ThreadQuery) -> Result<Mailbox, 
     counts.scheduled = scheduled.len() as i64;
     let mut labels = load_labels(conn, &account_filter)?;
     labels.retain(|label| in_group(&label.account_id));
-    for label in &mut labels {
-        if label.kind != "user" {
-            continue;
+    // One pass over the conversations, counting each once per label it has unread mail under.
+    let mut label_unread: HashMap<(&str, &str), i64> = HashMap::new();
+    for ((account_id, _), messages) in &groups {
+        let mut seen: Vec<&str> = Vec::new();
+        for message in messages {
+            if !has_label(&message.label_ids, "UNREAD") || has_label(&message.label_ids, "TRASH") {
+                continue;
+            }
+            for label in &message.label_ids {
+                if !seen.contains(&label.as_str()) {
+                    seen.push(label);
+                }
+            }
         }
-        label.unread = groups
-            .values()
-            .filter(|messages| {
-                messages.iter().any(|message| {
-                    message.account_id == label.account_id
-                        && has_label(&message.label_ids, &label.id)
-                        && has_label(&message.label_ids, "UNREAD")
-                        && !has_label(&message.label_ids, "TRASH")
-                })
-            })
-            .count() as i64;
+        for label in seen {
+            *label_unread.entry((account_id.as_str(), label)).or_default() += 1;
+        }
     }
+    for label in &mut labels {
+        if label.kind == "user" {
+            label.unread = label_unread
+                .get(&(label.account_id.as_str(), label.id.as_str()))
+                .copied()
+                .unwrap_or(0);
+        }
+    }
+    drop(label_unread);
     let search = query.search.as_deref().unwrap_or("").trim().to_string();
     let threads = if query.folder == "scheduled" && search.is_empty() {
         scheduled_threads(&scheduled, &account_map)
@@ -815,6 +916,7 @@ pub fn query_mailbox(conn: &Connection, query: &ThreadQuery) -> Result<Mailbox, 
         }
         threads
     } else {
+        let headers: Vec<Header> = groups.into_values().flatten().collect();
         let matched = match scoped_fts_ids(conn, &search, &account_filter, query.account_ids.as_deref())? {
             Some(ids) => ids,
             None => like_ids(&headers, &search),
@@ -823,7 +925,7 @@ pub fn query_mailbox(conn: &Connection, query: &ThreadQuery) -> Result<Mailbox, 
             .into_iter()
             .filter(|header| matched.contains(&(header.account_id.clone(), header.id.clone())))
             .collect();
-        summarize(group_headers(&filtered), &account_map, "all", None, None, tabs)
+        summarize(group_headers(filtered), &account_map, "all", None, None, tabs)
     };
     let offset = query.offset.max(0) as usize;
     let limit = query.limit.clamp(1, 200) as usize;
@@ -852,18 +954,28 @@ pub fn threads_for_messages(conn: &Connection, keys: &[(String, String)]) -> Res
             }
         }
     }
-    let mut threads = summarize(group_headers(&headers), &account_map, "all", None, None, &InboxTabs::default());
+    let mut threads = summarize(group_headers(headers), &account_map, "all", None, None, &InboxTabs::default());
     threads.truncate(200);
     Ok(threads)
 }
 
+// The unread queries below repeat the exact condition of idx_messages_unread, which is what
+// lets SQLite answer them from that small index. Conversation ids are per account, so the
+// total is the sum over accounts.
 pub fn total_unread(conn: &Connection) -> Result<i64, String> {
-    conn.query_row(
-        "SELECT COUNT(DISTINCT thread_id) FROM messages WHERE instr(label_ids, '\"UNREAD\"') > 0 AND instr(label_ids, '\"INBOX\"') > 0 AND instr(label_ids, '\"TRASH\"') = 0 AND instr(label_ids, '\"SPAM\"') = 0",
-        [],
-        |row| row.get(0),
-    )
-    .map_err(|e| e.to_string())
+    Ok(unread_counts(conn)?.values().sum())
+}
+
+fn unread_counts(conn: &Connection) -> Result<HashMap<String, i64>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT account_id, COUNT(DISTINCT thread_id) FROM messages WHERE instr(label_ids, '\"UNREAD\"') > 0 AND instr(label_ids, '\"INBOX\"') > 0 AND instr(label_ids, '\"TRASH\"') = 0 AND instr(label_ids, '\"SPAM\"') = 0 GROUP BY account_id",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<HashMap<_, _>, _>>().map_err(|e| e.to_string())
 }
 
 pub fn attachment_meta(conn: &Connection, account_id: &str, message_id: &str, attachment_id: &str) -> Result<AttachmentMeta, String> {
@@ -882,7 +994,7 @@ pub fn attachment_meta(conn: &Connection, account_id: &str, message_id: &str, at
 
 fn unread_count(conn: &Connection, account_id: &str) -> Result<i64, String> {
     conn.query_row(
-        "SELECT COUNT(DISTINCT thread_id) FROM messages WHERE account_id = ?1 AND instr(label_ids, '\"UNREAD\"') > 0 AND instr(label_ids, '\"INBOX\"') > 0 AND instr(label_ids, '\"TRASH\"') = 0 AND instr(label_ids, '\"SPAM\"') = 0",
+        "SELECT COUNT(DISTINCT thread_id) FROM messages WHERE instr(label_ids, '\"UNREAD\"') > 0 AND instr(label_ids, '\"INBOX\"') > 0 AND instr(label_ids, '\"TRASH\"') = 0 AND instr(label_ids, '\"SPAM\"') = 0 AND account_id = ?1",
         [account_id],
         |row| row.get(0),
     )
@@ -904,6 +1016,7 @@ fn read_account(row: &rusqlite::Row) -> rusqlite::Result<Account> {
         backfill_token: row.get(9)?,
         backfill_done: row.get::<_, i64>(10)? != 0,
         initial_done: row.get::<_, i64>(11)? != 0,
+        provider: row.get(12)?,
     })
 }
 
@@ -949,38 +1062,48 @@ struct Header {
     has_attachments: bool,
 }
 
+const HEADER_COLUMNS: &str =
+    "SELECT account_id, id, thread_id, from_name, from_email, subject, snippet, date, label_ids, has_attachments FROM messages";
+
+fn read_header(row: &rusqlite::Row) -> rusqlite::Result<Header> {
+    let label_ids: Vec<String> = json_vec(&row.get::<_, String>(8)?);
+    Ok(Header {
+        account_id: row.get(0)?,
+        id: row.get(1)?,
+        thread_id: row.get(2)?,
+        from_name: row.get(3)?,
+        from_email: row.get(4)?,
+        subject: row.get(5)?,
+        snippet: row.get(6)?,
+        date: row.get(7)?,
+        label_ids,
+        has_attachments: row.get::<_, i64>(9)? != 0,
+    })
+}
+
+/// The list data of every message, or of one account's. Every column comes from
+/// idx_messages_list, so the message bodies are never read.
 fn load_headers(conn: &Connection, account_id: &str) -> Result<Vec<Header>, String> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT account_id, id, thread_id, from_name, from_email, subject, snippet, date, label_ids, has_attachments
-             FROM messages WHERE (?1 = '' OR account_id = ?1)",
-        )
-        .map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map(params![account_id], |row| {
-            let label_ids: Vec<String> = json_vec(&row.get::<_, String>(8)?);
-            Ok(Header {
-                account_id: row.get(0)?,
-                id: row.get(1)?,
-                thread_id: row.get(2)?,
-                from_name: row.get(3)?,
-                from_email: row.get(4)?,
-                subject: row.get(5)?,
-                snippet: row.get(6)?,
-                date: row.get(7)?,
-                label_ids,
-                has_attachments: row.get::<_, i64>(9)? != 0,
-            })
-        })
-        .map_err(|e| e.to_string())?;
+    // Two statements, since a combined "all or this one" condition would stop SQLite from
+    // going straight to the one account in the index.
+    let (sql, args): (String, &[&dyn rusqlite::ToSql]) = if account_id.is_empty() {
+        (HEADER_COLUMNS.to_string(), &[])
+    } else {
+        (format!("{HEADER_COLUMNS} WHERE account_id = ?1"), &[&account_id])
+    };
+    let mut stmt = conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
+    let rows = stmt.query_map(args, read_header).map_err(|e| e.to_string())?;
     rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
 }
 
 fn load_thread_headers(conn: &Connection, account_id: &str, thread_id: &str) -> Result<Vec<Header>, String> {
-    Ok(load_headers(conn, account_id)?
-        .into_iter()
-        .filter(|header| header.thread_id == thread_id)
-        .collect())
+    let mut stmt = conn
+        .prepare_cached(&format!("{HEADER_COLUMNS} WHERE account_id = ?1 AND thread_id = ?2"))
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![account_id, thread_id], read_header)
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
 }
 
 fn lookup_thread(conn: &Connection, account_id: &str, message_id: &str) -> Result<Option<String>, String> {
@@ -1093,13 +1216,15 @@ fn like_ids(headers: &[Header], needle: &str) -> HashSet<(String, String)> {
         .collect()
 }
 
-fn group_headers(headers: &[Header]) -> HashMap<(String, String), Vec<Header>> {
+/// Sorts messages into conversations. Takes the headers rather than copying them: a large
+/// mailbox has tens of thousands, and this runs for every refresh of the list.
+fn group_headers(headers: Vec<Header>) -> HashMap<(String, String), Vec<Header>> {
     let mut groups: HashMap<(String, String), Vec<Header>> = HashMap::new();
     for header in headers {
         groups
             .entry((header.account_id.clone(), header.thread_id.clone()))
             .or_default()
-            .push(header.clone());
+            .push(header);
     }
     groups
 }
@@ -1183,7 +1308,7 @@ fn summarize(
         }
         let latest = matching
             .iter()
-            .max_by_key(|message| (message.date, message.id.clone()))
+            .max_by_key(|message| (message.date, message.id.as_str()))
             .expect("matching is non-empty");
         let (email, color) = accounts
             .get(&account_id)
@@ -1414,6 +1539,53 @@ mod tests {
         assert!(ask(Some(vec![]), None).threads.is_empty());
     }
 
+    /// Times the list queries against a real mailbox file. Point NOVABOX_BENCH_DB at a copy
+    /// (never the live file: this migrates it) and run
+    /// `cargo test --lib list_query_speed -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn list_query_speed() {
+        let path = std::env::var("NOVABOX_BENCH_DB").expect("set NOVABOX_BENCH_DB to a copy of novabox.db");
+        let started = std::time::Instant::now();
+        let conn = open(Path::new(&path)).unwrap();
+        println!("open and migrate: {} ms", started.elapsed().as_millis());
+        let accounts = list_accounts(&conn).unwrap();
+        let largest = accounts
+            .iter()
+            .max_by_key(|account| message_count(&conn, &account.id).unwrap_or(0))
+            .map(|account| account.id.clone());
+        let smallest = accounts
+            .iter()
+            .min_by_key(|account| message_count(&conn, &account.id).unwrap_or(0))
+            .map(|account| account.id.clone());
+        let ask = |account_id: Option<String>, folder: &str, search: Option<&str>| ThreadQuery {
+            account_id,
+            account_ids: None,
+            folder: folder.into(),
+            label_id: None,
+            category: Some("primary".into()),
+            search: search.map(|text| text.to_string()),
+            limit: 50,
+            offset: 0,
+            inbox_tabs: InboxTabs::default(),
+        };
+        for (name, query) in [
+            ("all inboxes", ask(None, "inbox", None)),
+            ("all inboxes again", ask(None, "inbox", None)),
+            ("largest account", ask(largest, "inbox", None)),
+            ("smallest account", ask(smallest, "inbox", None)),
+            ("all sent", ask(None, "sent", None)),
+            ("search", ask(None, "inbox", Some("invoice"))),
+        ] {
+            let started = std::time::Instant::now();
+            let found = query_mailbox(&conn, &query).unwrap();
+            println!("{name}: {} ms ({} conversations)", started.elapsed().as_millis(), found.total);
+        }
+        let started = std::time::Instant::now();
+        let unread = total_unread(&conn).unwrap();
+        println!("unread badge: {} us ({unread} unread)", started.elapsed().as_micros());
+    }
+
     #[test]
     fn folders_search_and_labels() {
         let conn = Connection::open_in_memory().unwrap();
@@ -1432,6 +1604,7 @@ mod tests {
             backfill_token: None,
             backfill_done: false,
             initial_done: false,
+            provider: "gmail".into(),
         };
         upsert_account(&conn, &account).unwrap();
         upsert_message(&conn, &message("a", "t1", &["INBOX", "UNREAD"], "Lease", "rent is due")).unwrap();

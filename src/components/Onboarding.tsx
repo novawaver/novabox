@@ -1,12 +1,14 @@
 import { useState } from "react";
+import { AddAccountDialog } from "./AddAccountDialog";
 import { BackupDialog } from "./BackupDialog";
-import { GoogleMark, LogoMark } from "./Icons";
+import { GoogleMark, IconMail, LogoMark } from "./Icons";
 import { useMail } from "../state/MailProvider";
 import { inTauri } from "../platform";
 
 export function Onboarding() {
   const mail = useMail();
   const [importing, setImporting] = useState(false);
+  const [addingPrivateEmail, setAddingPrivateEmail] = useState(false);
   return (
     <div className="grid min-h-full place-items-center bg-bg px-6 py-10">
       <div className="w-full max-w-xl">
@@ -14,12 +16,12 @@ export function Onboarding() {
           <LogoMark className="h-11 w-11" />
           <div>
             <div className="text-lg font-semibold tracking-tight">Novabox</div>
-            <div className="text-sm text-muted">Works with Gmail</div>
+            <div className="text-sm text-muted">Works with Gmail and Private Email</div>
           </div>
         </div>
-        <h1 className="text-4xl font-semibold tracking-tight text-balance">Every Gmail account, one window.</h1>
+        <h1 className="text-4xl font-semibold tracking-tight text-balance">Every mail account, one window.</h1>
         <p className="mt-4 max-w-lg text-lg leading-relaxed text-muted">
-          Novabox reads and sends mail from this PC directly to Google. Messages stay on this computer. They are not uploaded to a Novawave server.
+          Novabox reads and sends mail from this PC directly to Google or Private Email. Messages stay on this computer. They are not uploaded to a Novawave server.
         </p>
         <div className="mt-8 flex flex-wrap items-center gap-3">
           <button type="button" className="rounded-full bg-accent px-5 py-2.5 font-semibold text-accent-ink" onClick={mail.openDemo}>
@@ -39,6 +41,15 @@ export function Onboarding() {
               Cancel
             </button>
           )}
+          <button
+            type="button"
+            className="inline-flex items-center gap-2 rounded-full border border-line px-4 py-2.5 font-medium hover:bg-hover disabled:opacity-50"
+            onClick={() => setAddingPrivateEmail(true)}
+            disabled={mail.signInBusy}
+          >
+            <IconMail />
+            Add a Private Email account
+          </button>
         </div>
         {inTauri() && (
           <p className="mt-4 text-sm text-muted">
@@ -53,6 +64,7 @@ export function Onboarding() {
         )}
         {mail.signInError && <p className="mt-4 text-sm text-danger">{mail.signInError}</p>}
         {importing && <BackupDialog mode="import" onClose={() => setImporting(false)} />}
+        {addingPrivateEmail && <AddAccountDialog start="privateemail" onClose={() => setAddingPrivateEmail(false)} />}
       </div>
     </div>
   );

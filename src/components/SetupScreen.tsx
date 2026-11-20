@@ -31,7 +31,7 @@ export function SetupScreen() {
         ) : (
           <>
             <p className="mt-6 text-lg font-medium tabular-nums">
-              {setup.fetched > 0 ? `Downloaded ${setup.fetched.toLocaleString()} messages` : "Connecting to Gmail…"}
+              {setup.fetched > 0 ? `Downloaded ${setup.fetched.toLocaleString()} messages` : "Connecting…"}
             </p>
             <p className="mt-2 text-sm text-muted">Your newest mail is downloading. Older mail keeps downloading in the background after this.</p>
           </>

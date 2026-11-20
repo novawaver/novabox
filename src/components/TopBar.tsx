@@ -1,25 +1,28 @@
 import { IconCloudOff, IconMenu, IconSearch, IconSettings, IconSignal, IconSync, LogoMark } from "./Icons";
 import { useMail, type Connection } from "../state/MailProvider";
+import { serviceName } from "../types";
 
-// Round trips to Gmail's history endpoint; a healthy connection is usually well under 600 ms.
+// Round trips of the new-mail check; a healthy connection is usually well under 600 ms.
 const STRONG_MS = 600;
 const FAIR_MS = 1500;
 
-function describeConnection(connection: Connection): { level: number; off: boolean; tone: string; text: string } {
+function describeConnection(connection: Connection, service: string): { level: number; off: boolean; tone: string; text: string } {
   const { state, latencyMs, message } = connection;
-  if (state === "offline") return { level: 0, off: true, tone: "text-danger", text: "Offline. Gmail cannot be reached." };
-  if (state === "error") return { level: 0, off: true, tone: "text-danger", text: `Gmail error: ${message}` };
-  if (state === "checking") return { level: 0, off: false, tone: "text-muted", text: "Checking connection to Gmail…" };
-  if (latencyMs === null) return { level: 3, off: false, tone: "", text: "Connected to Gmail" };
+  // "Gmail", "Private Email", or "your mail services" when the accounts are a mix.
+  const named = service.charAt(0).toUpperCase() + service.slice(1);
+  if (state === "offline") return { level: 0, off: true, tone: "text-danger", text: `Offline. ${named} cannot be reached.` };
+  if (state === "error") return { level: 0, off: true, tone: "text-danger", text: `Connection error: ${message}` };
+  if (state === "checking") return { level: 0, off: false, tone: "text-muted", text: `Checking connection to ${service}…` };
+  if (latencyMs === null) return { level: 3, off: false, tone: "", text: `Connected to ${service}` };
   const timing = `${latencyMs.toLocaleString()} ms`;
-  if (latencyMs <= STRONG_MS) return { level: 3, off: false, tone: "", text: `Connected to Gmail · strong (${timing})` };
-  if (latencyMs <= FAIR_MS) return { level: 2, off: false, tone: "text-star", text: `Connected to Gmail · fair (${timing})` };
-  return { level: 1, off: false, tone: "text-danger", text: `Connected to Gmail · slow (${timing}). New mail may arrive late.` };
+  if (latencyMs <= STRONG_MS) return { level: 3, off: false, tone: "", text: `Connected to ${service} · strong (${timing})` };
+  if (latencyMs <= FAIR_MS) return { level: 2, off: false, tone: "text-star", text: `Connected to ${service} · fair (${timing})` };
+  return { level: 1, off: false, tone: "text-danger", text: `Connected to ${service} · slow (${timing}). New mail may arrive late.` };
 }
 
 export function TopBar() {
   const mail = useMail();
-  const link = describeConnection(mail.connection);
+  const link = describeConnection(mail.connection, serviceName(mail.accounts));
   const status = mail.syncing ? mail.syncLabel || "Syncing…" : mail.offline ? "Offline. Click to try again." : "Up to date. Click to check for new mail.";
   // An open conversation names its own account, which matters in All inboxes and in groups.
   const account = mail.accounts.find((item) => item.id === mail.query.accountId);

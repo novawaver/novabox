@@ -1,6 +1,6 @@
 # Novabox
 
-Novabox is a Windows desktop app for reading and sending mail from several Gmail accounts in one window. It talks to Google from this PC. Mail is cached in a local SQLite database. Refresh tokens are stored in Windows Credential Manager. There is no Novawave server in the path.
+Novabox is a Windows desktop app for reading and sending mail from several accounts in one window. It works with Gmail and with Private Email (privateemail.com), and talks to them from this PC. Mail is cached in a local SQLite database. Sign-ins (Google refresh tokens and Private Email passwords) are stored in Windows Credential Manager. There is no Novawave server in the path.
 
 The browser preview (`npm run dev`) starts on a welcome screen. Choose **Explore the sample inbox** to try the layout before Google sign-in is configured. Nothing in that inbox is sent to Google.
 
@@ -24,6 +24,21 @@ While the OAuth app is in Testing, up to 100 test users can sign in. They will s
 
 Removing an account deletes its local mail and revokes the saved token.
 
+## Private Email
+
+Private Email accounts need no setup in the build. Use the **+** button, choose **Private Email**, and enter the mailbox's email address and password. Novabox signs in to `mail.privateemail.com` over IMAP (port 993) and sends through SMTP (port 465), both over TLS.
+
+IMAP keeps a message in one folder, so a few things work differently from Gmail:
+
+- Folders other than Inbox, Sent, Drafts, Spam, Trash and Archive appear under **Labels**. Adding a label moves the conversation into that folder; removing it moves the conversation back to the inbox.
+- Archive moves mail to the Archive folder (created if the mailbox has none).
+- There are no Promotions, Social or Updates tabs; all inbox mail is in Primary.
+- Conversations are grouped from the messages' reply headers.
+- New mail is checked for every 10 seconds. A large mailbox downloads newest first, a few hundred messages per sync.
+- Removing the account forgets the password on this PC. Nothing changes in the mailbox.
+
+Other IMAP services can be added as entries in `SERVERS` in `src-tauri/src/imap.rs`.
+
 ## What version 1 includes
 
 - Account rail, unified inbox, and per-account folders
@@ -31,13 +46,13 @@ Removing an account deletes its local mail and revokes the saved token.
 - Labels, star, archive, trash, spam, read/unread, and multi-select
 - Thread view with remote images blocked until you show them
 - Compose, reply, reply all, forward, From addresses, signatures, and drafts
-- Local full-text search, plus Gmail search when you press Enter
+- Local full-text search, plus a search on the mail service when you press Enter
 - Background sync, tray icon, unread window title, optional start with Windows
 - Light, dark, and system themes, and three densities
 
 Snooze, scheduled send, and templates are included. A snoozed conversation leaves the inbox until the time you pick, then comes back on this PC. A scheduled message stays in Scheduled until Novabox sends it. Templates are saved on this PC.
 
-Outlook and a paid account limit are left for a later version. During this private build, account limits are off.
+Private Email accounts are supported alongside Gmail. Outlook and a paid account limit are left for a later version. During this private build, account limits are off.
 
 ## Build the installer
 

@@ -14,7 +14,23 @@ export type Account = {
   unread: number;
   signature: string;
   sendAs: SendAs[];
+  /** The mail service: "gmail" (also when missing) or "privateemail". */
+  provider?: string;
 };
+
+export const PRIVATE_EMAIL = "privateemail";
+
+/** Whether an account is with Google, as opposed to a service signed in to with a password. */
+export function isGoogle(account: Pick<Account, "provider"> | undefined): boolean {
+  return !account?.provider || account.provider === "gmail";
+}
+
+/** What to call the mail service of these accounts in a sentence. */
+export function serviceName(accounts: Pick<Account, "provider">[]): string {
+  if (accounts.every((account) => isGoogle(account))) return "Gmail";
+  if (accounts.every((account) => account.provider === PRIVATE_EMAIL)) return "Private Email";
+  return "your mail services";
+}
 
 export type Label = {
   accountId: string;

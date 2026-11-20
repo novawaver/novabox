@@ -6,12 +6,11 @@ fn entry(account_id: &str) -> Result<Entry, String> {
     Entry::new(SERVICE, account_id).map_err(|e| format!("Windows Credential Manager: {e}"))
 }
 
-pub fn save(account_id: &str, refresh_token: &str) -> Result<(), String> {
+/// Stores an account's secret: a Google refresh token, or the password of an IMAP account.
+pub fn save(account_id: &str, secret: &str) -> Result<(), String> {
     entry(account_id)?
-        .set_password(refresh_token)
-        .map_err(|e| {
-            format!("Could not store the Google sign-in in Windows Credential Manager: {e}")
-        })
+        .set_password(secret)
+        .map_err(|e| format!("Could not store the sign-in in Windows Credential Manager: {e}"))
 }
 
 pub fn load(account_id: &str) -> Result<String, String> {

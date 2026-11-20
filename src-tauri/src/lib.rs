@@ -13,6 +13,7 @@ mod commands;
 mod db;
 mod files;
 mod gmail;
+mod imap;
 mod later;
 mod mime_build;
 mod model;
@@ -30,6 +31,8 @@ pub(crate) struct AppState {
     pub db: Mutex<rusqlite::Connection>,
     pub http: reqwest::Client,
     pub tokens: Mutex<HashMap<String, auth::CachedToken>>,
+    /// Connections and inbox state of the accounts reached over IMAP.
+    pub imap: imap::State,
     pub data_dir: std::path::PathBuf,
     pub syncing_accounts: Mutex<HashSet<String>>,
     /// When each account's labels were last compared with Gmail's lists.
@@ -172,6 +175,7 @@ pub fn run() {
                 db: Mutex::new(db),
                 http,
                 tokens: Mutex::new(HashMap::new()),
+                imap: imap::State::default(),
                 data_dir: dir,
                 syncing_accounts: Mutex::new(HashSet::new()),
                 label_checks: Mutex::new(HashMap::new()),
@@ -196,7 +200,7 @@ pub fn run() {
                     let _ = sync::sync_all(&startup).await;
                 });
                 std::thread::sleep(Duration::from_secs(6));
-                // Every 10s: a cheap history check for new mail. Every 2 min: the full sync
+                // Every 10s: a cheap check for new mail. Every 2 min: the full sync
                 // (labels, older mail, spam/trash, drafts).
                 let mut ticks = 0u32;
                 loop {
@@ -242,6 +246,7 @@ pub fn run() {
             commands::mailbox_query,
             commands::thread_get,
             commands::sign_in,
+            commands::sign_in_password,
             commands::sign_in_cancel,
             commands::account_remove,
             commands::account_set_signature,

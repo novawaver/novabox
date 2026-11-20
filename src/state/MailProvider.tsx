@@ -27,6 +27,7 @@ import {
   type ThreadDetail,
   type ThreadSummary,
   type ThreadTarget,
+  isGoogle,
 } from "../types";
 
 function normalizeSettings(value: Partial<Settings> | null | undefined): Settings {
@@ -137,6 +138,8 @@ export type MailApi = {
   openDemo: () => void;
   leaveDemo: () => void;
   signIn: () => Promise<void>;
+  /** Adds an account that signs in with a password. Resolves to an error message, or "" when it worked. */
+  signInPassword: (provider: string, email: string, password: string, name: string) => Promise<string>;
   cancelSignIn: () => void;
   removeAccount: (id: string, revoke?: boolean) => Promise<void>;
   importSignIns: (path: string, password: string) => Promise<ImportItem[]>;
@@ -995,20 +998,37 @@ export function MailProvider({ children }: { children: ReactNode }) {
       // Closing it when this window is focused again makes the browser report connection refused.
       const known = new Set(accountsRef.current.map((item) => item.id));
       syncResultsRef.current.clear();
-      const account = await api.signIn();
-      if (!known.has(account.id)) {
-        setSetup({ accountId: account.id, email: account.email, fetched: 0, error: "" });
-        const early = syncResultsRef.current.get(account.id);
-        if (early) finishSetup(early);
-      }
-      setMode("live");
-      await reloadLive();
+      await showNewAccount(await api.signIn(), known);
     } catch (error) {
       const text = messageOf(error);
       if (!/sign-in was cancelled/i.test(text)) setSignInError(text);
     } finally {
       setSignInBusy(false);
     }
+  }
+
+  async function signInPassword(provider: string, email: string, password: string, name: string): Promise<string> {
+    if (!inTauri()) return "Open the Novabox window to add an account. This browser view can explore the sample inbox.";
+    setSignInError("");
+    try {
+      const known = new Set(accountsRef.current.map((item) => item.id));
+      syncResultsRef.current.clear();
+      await showNewAccount(await api.signInPassword(provider, email, password, name), known);
+      return "";
+    } catch (error) {
+      return messageOf(error);
+    }
+  }
+
+  /** Switches to live mail after a sign-in, behind the setup screen if the account is new here. */
+  async function showNewAccount(account: Account, known: Set<string>) {
+    if (!known.has(account.id)) {
+      setSetup({ accountId: account.id, email: account.email, fetched: 0, error: "" });
+      const early = syncResultsRef.current.get(account.id);
+      if (early) finishSetup(early);
+    }
+    setMode("live");
+    await reloadLive();
   }
 
   function setSetup(next: Setup | null) {
@@ -1020,7 +1040,7 @@ export function MailProvider({ children }: { children: ReactNode }) {
     const current = setupRef.current;
     if (!current) return;
     if (result.ok) setSetup(null);
-    else setSetup({ ...current, error: result.message || "Could not download mail from Gmail." });
+    else setSetup({ ...current, error: result.message || "Could not download the mail." });
   }
 
   function retrySetup() {
@@ -1048,7 +1068,9 @@ export function MailProvider({ children }: { children: ReactNode }) {
   async function removeAccount(id: string, revoke = true) {
     const account = box.accounts.find((item) => item.id === id);
     const label = account?.email ?? "this account";
-    const question = revoke
+    const question = !isGoogle(account)
+      ? `Remove ${label} from this PC? Mail saved here for that account will be deleted and its password forgotten. Nothing changes in the mailbox itself.`
+      : revoke
       ? `Sign out of ${label}? Mail saved on this PC for that account will be deleted, and Google access will be revoked, which also signs it out on any other PC that uses the same sign-in from a backup.`
       : `Remove ${label} from this PC? Mail saved here for that account will be deleted. Google access is kept, so other PCs and your sign-in backups keep working.`;
     if (!window.confirm(question)) return;
@@ -1375,6 +1397,7 @@ export function MailProvider({ children }: { children: ReactNode }) {
     openDemo,
     leaveDemo,
     signIn,
+    signInPassword,
     cancelSignIn,
     removeAccount,
     importSignIns,

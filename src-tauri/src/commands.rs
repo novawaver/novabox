@@ -11,14 +11,15 @@ use crate::auth::{self, REDIRECT_URI};
 use crate::db;
 use crate::files;
 use crate::gmail;
+use crate::imap;
 use crate::mime_build::{self, OutgoingMail};
 use crate::outbox::{self, Job};
 use rand::RngCore;
 
 use crate::model::{
     Account, Address, AppInfo, AttachmentData, AttachmentRequest, ComposeRequest, Mailbox,
-    ModifyBatch, SaveAttachmentRequest, SendResult, Settings, SignatureUpdate, StoredMessage,
-    Template, ThreadDetail, ThreadQuery, ThreadTarget,
+    ModifyBatch, PasswordSignIn, SaveAttachmentRequest, SendResult, Settings, SignatureUpdate,
+    StoredMessage, Template, ThreadDetail, ThreadQuery, ThreadTarget,
 };
 use crate::parse;
 use crate::secrets;
@@ -138,6 +139,61 @@ pub async fn sign_in(app: AppHandle) -> Result<Account, String> {
             backfill_token: None,
             backfill_done: false,
             initial_done: false,
+            provider: crate::model::default_provider(),
+        },
+    )
+    .await
+}
+
+/// Adds an account of a mail service that signs in with an email address and password
+/// (Private Email). The password is checked by signing in, then kept in Windows Credential
+/// Manager like a Google sign-in.
+#[tauri::command]
+pub async fn sign_in_password(app: AppHandle, request: PasswordSignIn) -> Result<Account, String> {
+    let email = request.email.trim().to_string();
+    if mime_build::split_emails(&email).map(|list| list.len()).unwrap_or(0) != 1 {
+        return Err("Enter the full email address, like name@example.com.".into());
+    }
+    if request.password.is_empty() {
+        return Err("Enter the password for this mailbox.".into());
+    }
+    let other = with_db(&app, db::list_accounts)?
+        .into_iter()
+        .any(|account| account.email.eq_ignore_ascii_case(&email) && account.provider != request.provider);
+    if other {
+        return Err("That address is already in Novabox as another kind of account. Remove it first.".into());
+    }
+    let id = imap::sign_in(&app, &request.provider, &email, &request.password).await?;
+    let (secret_id, password) = (id.clone(), request.password.clone());
+    tauri::async_runtime::spawn_blocking(move || secrets::save(&secret_id, &password))
+        .await
+        .map_err(|e| e.to_string())??;
+    let name = match request.name.trim() {
+        "" => email.split('@').next().unwrap_or(&email).to_string(),
+        name => name.chars().take(80).collect(),
+    };
+    register_account(
+        &app,
+        Account {
+            id,
+            email: email.clone(),
+            name: name.clone(),
+            picture: None,
+            color: String::new(),
+            unread: 0,
+            signature: String::new(),
+            send_as: vec![crate::model::SendAs {
+                email,
+                display_name: name,
+                is_default: true,
+                is_primary: true,
+            }],
+            history_id: None,
+            recent_page_token: None,
+            backfill_token: None,
+            backfill_done: false,
+            initial_done: false,
+            provider: request.provider,
         },
     )
     .await
@@ -148,6 +204,7 @@ pub async fn sign_in(app: AppHandle) -> Result<Account, String> {
 /// sync progress; a new one gets `account.color`, or the next palette colour if that is empty.
 pub(crate) async fn register_account(app: &AppHandle, account: Account) -> Result<Account, String> {
     let id = account.id.clone();
+    let over_imap = imap::handles(&account.provider);
     with_db(app, |conn| {
         let existing = db::list_accounts(conn)?;
         let mut account = account;
@@ -156,11 +213,14 @@ pub(crate) async fn register_account(app: &AppHandle, account: Account) -> Resul
         }
         db::upsert_account(conn, &account)
     })?;
-    if let Ok(labels) = gmail::labels(app, &id).await {
-        let _ = with_db(app, |conn| db::replace_labels(conn, &id, &labels));
-    }
-    if let Ok(send_as) = gmail::send_as(app, &id).await {
-        let _ = with_db(app, |conn| db::update_send_as(conn, &id, &send_as));
+    // An IMAP account's folders arrive with its first sync, and it has no aliases to fetch.
+    if !over_imap {
+        if let Ok(labels) = gmail::labels(app, &id).await {
+            let _ = with_db(app, |conn| db::replace_labels(conn, &id, &labels));
+        }
+        if let Ok(send_as) = gmail::send_as(app, &id).await {
+            let _ = with_db(app, |conn| db::update_send_as(conn, &id, &send_as));
+        }
     }
     let account = with_db(app, |conn| db::get_account(conn, &id))?;
     let app_for_sync = app.clone();
@@ -173,10 +233,12 @@ pub(crate) async fn register_account(app: &AppHandle, account: Account) -> Resul
 
 #[tauri::command]
 /// Removes an account from this PC. With `revoke` (the default) Google access is revoked
-/// too, which signs it out on every PC that shares the sign-in through a backup.
+/// too, which signs it out on every PC that shares the sign-in through a backup. A password
+/// account has nothing to revoke; its password is only forgotten here.
 pub async fn account_remove(app: AppHandle, account_id: String, revoke: Option<bool>) -> Result<(), String> {
-    let refresh = secrets::load(&account_id).ok();
-    if let (Some(refresh), true) = (refresh, revoke.unwrap_or(true)) {
+    if imap::uses(&app, &account_id) {
+        imap::forget(&app, &account_id);
+    } else if let (Ok(refresh), true) = (secrets::load(&account_id), revoke.unwrap_or(true)) {
         let http = app.state::<AppState>().http.clone();
         let _ = auth::revoke(&http, &refresh).await;
     }
@@ -215,7 +277,33 @@ pub async fn threads_modify(app: AppHandle, batch: ModifyBatch) -> Result<(), St
 
 #[tauri::command]
 pub async fn mail_send(app: AppHandle, request: ComposeRequest) -> Result<SendResult, String> {
-    let (raw, thread_id) = prepare_raw(&app, &request)?;
+    let (bytes, thread_id) = prepare_message(&app, &request)?;
+    if imap::uses(&app, &request.account_id) {
+        let mut recipients = Vec::new();
+        for list in [&request.to, &request.cc, &request.bcc] {
+            recipients.extend(mime_build::split_emails(list)?);
+        }
+        let filed = imap::send(
+            &app,
+            &request.account_id,
+            bytes,
+            request.from_email.clone(),
+            recipients,
+            request.draft_id.clone(),
+        )
+        .await?;
+        if let Some(draft_id) = &request.draft_id {
+            let _ = with_db(&app, |conn| db::delete_draft(conn, &request.account_id, draft_id));
+        }
+        crate::refresh_badge(&app);
+        let _ = app.emit("mail://updated", json!({}));
+        return Ok(SendResult {
+            message_id: filed.message_id,
+            thread_id: if filed.thread_id.is_empty() { thread_id.unwrap_or_default() } else { filed.thread_id },
+            draft_id: None,
+        });
+    }
+    let raw = mime_build::to_gmail_raw(&bytes);
     if let Some(draft_id) = request.draft_id.clone() {
         let _ = gmail::delete_draft(&app, &request.account_id, &draft_id).await;
         let _ = with_db(&app, |conn| db::delete_draft(conn, &request.account_id, &draft_id));
@@ -249,32 +337,40 @@ pub async fn mail_send(app: AppHandle, request: ComposeRequest) -> Result<SendRe
 
 #[tauri::command]
 pub async fn draft_save(app: AppHandle, request: ComposeRequest) -> Result<SendResult, String> {
-    let (raw, thread_id) = prepare_raw(&app, &request)?;
-    let response = if let Some(draft_id) = &request.draft_id {
-        gmail::update_draft(&app, &request.account_id, draft_id, &raw, thread_id.as_deref()).await?
+    let (bytes, thread_id) = prepare_message(&app, &request)?;
+    let (draft_id, message_id, thread_id) = if imap::uses(&app, &request.account_id) {
+        // In a folder a draft is simply a message, so the two ids are the same.
+        let filed = imap::save_draft(&app, &request.account_id, bytes, request.draft_id.clone(), thread_id).await?;
+        (filed.message_id.clone(), filed.message_id, filed.thread_id)
     } else {
-        gmail::create_draft(&app, &request.account_id, &raw, thread_id.as_deref()).await?
+        let raw = mime_build::to_gmail_raw(&bytes);
+        let response = if let Some(draft_id) = &request.draft_id {
+            gmail::update_draft(&app, &request.account_id, draft_id, &raw, thread_id.as_deref()).await?
+        } else {
+            gmail::create_draft(&app, &request.account_id, &raw, thread_id.as_deref()).await?
+        };
+        let draft_id = response
+            .get("id")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let message = &response["message"];
+        let message_id = message
+            .get("id")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let thread_id = message
+            .get("threadId")
+            .and_then(|value| value.as_str())
+            .or(thread_id.as_deref())
+            .unwrap_or(&message_id)
+            .to_string();
+        if draft_id.is_empty() || message_id.is_empty() {
+            return Err("Gmail did not save the draft.".into());
+        }
+        (draft_id, message_id, thread_id)
     };
-    let draft_id = response
-        .get("id")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default()
-        .to_string();
-    let message = &response["message"];
-    let message_id = message
-        .get("id")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default()
-        .to_string();
-    let thread_id = message
-        .get("threadId")
-        .and_then(|value| value.as_str())
-        .or(thread_id.as_deref())
-        .unwrap_or(&message_id)
-        .to_string();
-    if draft_id.is_empty() || message_id.is_empty() {
-        return Err("Gmail did not save the draft.".into());
-    }
     let previous = request.draft_id.as_deref().and_then(|id| {
         with_db(&app, |conn| db::draft_message_id(conn, &request.account_id, id)).ok().flatten()
     });
@@ -317,7 +413,11 @@ pub async fn draft_save(app: AppHandle, request: ComposeRequest) -> Result<SendR
 
 #[tauri::command]
 pub async fn draft_delete(app: AppHandle, account_id: String, draft_id: String) -> Result<(), String> {
-    let _ = gmail::delete_draft(&app, &account_id, &draft_id).await;
+    if imap::uses(&app, &account_id) {
+        let _ = imap::delete_draft(&app, &account_id, &draft_id).await;
+    } else {
+        let _ = gmail::delete_draft(&app, &account_id, &draft_id).await;
+    }
     with_db(&app, |conn| db::delete_draft(conn, &account_id, &draft_id))?;
     let _ = app.emit("mail://updated", json!({}));
     Ok(())
@@ -342,6 +442,11 @@ pub async fn remote_search(
     };
     let mut keys = Vec::new();
     for id in targets {
+        if imap::uses(&app, &id) {
+            let found = imap::search(&app, &id, &query).await?;
+            keys.extend(found.into_iter().map(|message_id| (id.clone(), message_id)));
+            continue;
+        }
         let (ids, _) = gmail::list_message_ids(&app, &id, &query, None).await?;
         let ids: Vec<String> = ids.into_iter().take(20).collect();
         for message_id in &ids {
@@ -424,7 +529,7 @@ pub async fn mail_schedule(app: AppHandle, request: ComposeRequest, send_at: i64
     if request.to.trim().is_empty() {
         return Err("Add a recipient before scheduling.".into());
     }
-    let _ = prepare_raw(&app, &request)?;
+    let _ = prepare_message(&app, &request)?;
     let id = local_id();
     let account_id = request.account_id.clone();
     with_db(&app, |conn| db::schedule_insert(conn, &id, &account_id, send_at, &request))?;
@@ -522,7 +627,7 @@ async fn apply_change(app: &AppHandle, target: &ThreadTarget, change: &Change) -
     local_change(app, target, change)
 }
 
-/// Applies a change on this PC and queues it for Gmail, which may refuse it and roll it back.
+/// Applies a change on this PC and queues it for the mail service, which may refuse it and roll it back.
 fn change_now(app: &AppHandle, target: &ThreadTarget, change: &Change) -> Result<(), String> {
     let before = with_db(app, |conn| db::thread_labels(conn, &target.account_id, &target.thread_id))?;
     local_change(app, target, change)?;
@@ -538,6 +643,9 @@ fn change_now(app: &AppHandle, target: &ThreadTarget, change: &Change) -> Result
 }
 
 pub(crate) async fn remote_change(app: &AppHandle, target: &ThreadTarget, change: &Change) -> Result<(), String> {
+    if imap::uses(app, &target.account_id) {
+        return imap::change(app, target, change).await;
+    }
     match change {
         Change::Trash => gmail::trash_thread(app, &target.account_id, &target.thread_id).await,
         Change::Untrash => gmail::untrash_thread(app, &target.account_id, &target.thread_id).await,
@@ -588,7 +696,8 @@ fn action_change(action: &str, label_id: Option<&str>) -> Result<Change, String>
     }
 }
 
-fn prepare_raw(app: &AppHandle, request: &ComposeRequest) -> Result<(String, Option<String>), String> {
+/// Builds the message a compose window describes, and the conversation it answers, if any.
+fn prepare_message(app: &AppHandle, request: &ComposeRequest) -> Result<(Vec<u8>, Option<String>), String> {
     let account = with_db(app, |conn| db::get_account(conn, &request.account_id))?;
     let allowed = account.email == request.from_email
         || account.send_as.iter().any(|alias| alias.email == request.from_email);
@@ -621,10 +730,7 @@ fn prepare_raw(app: &AppHandle, request: &ComposeRequest) -> Result<(String, Opt
         references: request.references.as_deref(),
     };
     let raw_bytes = mime_build::build_rfc822(&mail)?;
-    Ok((
-        mime_build::to_gmail_raw(&raw_bytes),
-        request.thread_id.clone().filter(|id| !id.is_empty()),
-    ))
+    Ok((raw_bytes, request.thread_id.clone().filter(|id| !id.is_empty())))
 }
 
 async fn load_attachment_bytes(app: &AppHandle, request: &AttachmentRequest) -> Result<Vec<u8>, String> {
@@ -635,6 +741,17 @@ async fn load_attachment_bytes(app: &AppHandle, request: &AttachmentRequest) -> 
         &request.message_id,
         &request.attachment_id,
     ) {
+        return Ok(bytes);
+    }
+    if imap::uses(app, &request.account_id) {
+        let bytes = imap::attachment(app, &request.account_id, &request.message_id, &request.attachment_id).await?;
+        let _ = files::write_cached(
+            &data_dir,
+            &request.account_id,
+            &request.message_id,
+            &request.attachment_id,
+            &bytes,
+        );
         return Ok(bytes);
     }
     if request.attachment_id.starts_with("inline-") {

@@ -31,6 +31,24 @@ pub struct Account {
     pub backfill_done: bool,
     #[serde(default, skip_serializing)]
     pub initial_done: bool,
+    /// Which mail service the account is with: "gmail", or "privateemail" (IMAP and SMTP).
+    #[serde(default = "default_provider")]
+    pub provider: String,
+}
+
+pub fn default_provider() -> String {
+    "gmail".into()
+}
+
+/// A sign-in for a mail service that takes an email address and password.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PasswordSignIn {
+    pub provider: String,
+    pub email: String,
+    pub password: String,
+    #[serde(default)]
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
