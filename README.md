@@ -19,7 +19,7 @@ While the OAuth app is in Testing, up to 100 test users can sign in. They will s
 2. Configure the consent screen as External, in Testing. Add every Gmail address you will use as a test user.
 3. Create an OAuth client of type **Desktop app**.
 4. Add this authorized redirect URI: `http://127.0.0.1:47821/oauth/callback`
-5. Request only `gmail.modify`, and the basic profile scopes (`openid`, `email`, `profile`).
+5. Add the scope `https://mail.google.com/` and the basic profile scopes (`openid`, `email`, `profile`). Full Gmail access is needed to delete mail in Trash for good; `gmail.modify` allows everything else but not that. An account signed in before this scope was requested keeps working, and only has to sign in again (the **+** button) before it can delete for good or empty Trash.
 6. In Novabox settings, paste the client ID and client secret, then use **Sign in with Google** once per account.
 
 Removing an account deletes its local mail and revokes the saved token.
@@ -44,6 +44,8 @@ Other IMAP services can be added as entries in `SERVERS` in `src-tauri/src/imap.
 - Account rail, unified inbox, and per-account folders
 - Gmail categories: Primary, Promotions, Social, Updates
 - Labels, star, archive, trash, spam, read/unread, and multi-select
+- Delete forever and Empty Trash, in the Trash folder. Both ask first and cannot be undone
+- Novabox labels: labels kept only on this PC, for conversations of any account, managed in the sidebar apart from the mail service's own labels (which are listed as Account labels). They are never sent to Gmail or the mail server
 - Thread view with remote images blocked until you show them
 - Compose, reply, reply all, forward, From addresses, signatures, and drafts
 - Local full-text search, plus a search on the mail service when you press Enter

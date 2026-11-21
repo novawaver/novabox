@@ -27,14 +27,25 @@ pub fn register(identifier: &str, data_dir: &Path) {
 #[cfg(not(windows))]
 pub fn register(_identifier: &str, _data_dir: &Path) {}
 
+/// Shows a desktop notification. `notice` is what the window knows about it (account,
+/// conversation); clicking the notification brings Novabox forward and opens that.
 #[tauri::command]
-pub fn notify_show(app: AppHandle, title: String, body: String) -> Result<(), String> {
+pub fn notify_show(app: AppHandle, title: String, body: String, notice: Option<serde_json::Value>) -> Result<(), String> {
     #[cfg(windows)]
     {
         let identifier = app.config().identifier.clone();
         // Showing a toast is a blocking WinRT call; keep it off the command thread.
         std::thread::spawn(move || {
-            if let Err(err) = tauri_winrt_notification::Toast::new(&identifier).title(&title).text1(&body).show() {
+            let toast = tauri_winrt_notification::Toast::new(&identifier)
+                .title(&title)
+                .text1(&body)
+                // Windows calls this in this process when the toast is clicked. Without it a
+                // click only dismisses the toast.
+                .on_activated(move |_| {
+                    crate::popup::open_notice(&app, notice.clone().unwrap_or(serde_json::Value::Null));
+                    Ok(())
+                });
+            if let Err(err) = toast.show() {
                 eprintln!("Novabox toast: {err}");
             }
         });
@@ -43,6 +54,7 @@ pub fn notify_show(app: AppHandle, title: String, body: String) -> Result<(), St
     #[cfg(not(windows))]
     {
         use tauri_plugin_notification::NotificationExt;
+        let _ = notice;
         app.notification().builder().title(title).body(body).show().map_err(|err| err.to_string())
     }
 }

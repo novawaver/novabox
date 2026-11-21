@@ -17,6 +17,7 @@ import {
   type Folder,
   type FolderCounts,
   type Label,
+  type LocalLabel,
   type Mailbox,
   type MailQuery,
   type MessageDetail,
@@ -85,6 +86,9 @@ type Undo = { text: string; targets: ThreadTarget[]; reverse: string; labelId?: 
 type Toast = { id: string; text: string };
 type Mode = "none" | "demo" | "live";
 /** A newly signed-in account whose first batch of mail is still downloading. */
+/** A question to confirm before something that can't be undone. */
+export type Ask = { title: string; body: string; confirmLabel: string; run: () => void };
+
 export type Setup = { accountId: string; email: string; fetched: number; error: string };
 /** How the last check of Gmail went. `latencyMs` is the round trip of a history call, when one was timed. */
 export type Connection = { state: "checking" | "online" | "offline" | "error"; latencyMs: number | null; message: string };
@@ -166,7 +170,20 @@ export type MailApi = {
   setCursor: (index: number) => void;
   act: (action: string, labelId?: string, targets?: ThreadTarget[]) => Promise<void>;
   undoAct: () => Promise<void>;
-  /** Deletes the trashed messages of the checked or open conversations for good. No undo. */
+  /** The question now waiting for a yes or no, shown as a dialog. */
+  ask: Ask | null;
+  closeAsk: () => void;
+  /** Asks, then deletes the trashed messages of these (or the checked or open) conversations for good. */
+  deleteForever: (targets?: ThreadTarget[]) => void;
+  /** Asks, then deletes everything in Trash for the accounts in view. */
+  emptyTrash: () => void;
+  /** Labels kept in Novabox only, apart from the mail service's own in `labels`. */
+  localLabels: LocalLabel[];
+  /** Creates (empty id) or changes a Novabox label. Resolves to an error message, or "" when saved. */
+  saveLocalLabel: (label: { id: string; name: string; color: string }) => Promise<string>;
+  deleteLocalLabel: (label: LocalLabel) => void;
+  /** Puts a Novabox label on these (or the checked or open) conversations, or takes it off. */
+  tagThreads: (labelId: string, on: boolean, targets?: ThreadTarget[]) => Promise<void>;
   saveSettings: (settings: Settings) => Promise<void>;
   setSignature: (accountId: string, signature: string) => Promise<void>;
   setSettingsOpen: (open: boolean) => void;
@@ -206,6 +223,7 @@ export function useMail(): MailApi {
 
 export function MailProvider({ children }: { children: ReactNode }) {
   const [ready, setReady] = useState(false);
+  const [ask, setAsk] = useState<Ask | null>(null);
   const [preparing, setPreparing] = useState(false);
   const [mode, setMode] = useState<Mode>("none");
   const [box, setBox] = useState<Mailbox>(emptyBox);
@@ -591,6 +609,121 @@ export function MailProvider({ children }: { children: ReactNode }) {
     }
   }
 
+  function deleteForever(targets?: ThreadTarget[]) {
+    const list = (targets && targets.length > 0 ? targets : currentTargets()).filter((target) => !target.threadId.startsWith("sched:"));
+    if (list.length === 0) return;
+    setAsk({
+      title: "Delete forever?",
+      body:
+        list.length > 1
+          ? `The mail in Trash from these ${list.length} conversations will be deleted for good. This can't be undone.`
+          : "The mail in Trash from this conversation will be deleted for good. This can't be undone.",
+      confirmLabel: "Delete forever",
+      run: () => void runDeleteForever(list),
+    });
+  }
+
+  async function runDeleteForever(list: ThreadTarget[]) {
+    const matches = (item: ThreadTarget) => list.some((target) => target.accountId === item.accountId && target.threadId === item.threadId);
+    // Off the list at once; a refusal brings the rows back with the reload below.
+    setBox((prev) => {
+      const threads = prev.threads.filter((item) => !matches(item));
+      return { ...prev, threads, total: Math.max(0, prev.total - (prev.threads.length - threads.length)) };
+    });
+    setChecked((keys) => keys.filter((key) => !matches(parseThreadKey(key))));
+    if (openRef.current && matches(openRef.current)) closeThread();
+    try {
+      if (modeRef.current === "demo" && demoRef.current) {
+        demoRef.current.messages = demoRef.current.messages.filter((message) => !(matches(message) && message.labelIds.includes("TRASH")));
+        publishDemo();
+      } else if (modeRef.current === "live") {
+        await api.threadsDelete(list);
+        await reloadLive();
+      }
+      toast(list.length > 1 ? `Deleted ${list.length} conversations for good` : "Deleted for good");
+    } catch (error) {
+      toast(messageOf(error));
+      if (modeRef.current === "live") void reloadLive().catch(() => {});
+    }
+  }
+
+  function emptyTrash() {
+    const asked = queryRef.current;
+    const account = accountsRef.current.find((item) => item.id === asked.accountId);
+    const group = settingsRef.current.accountGroups.find((item) => item.id === asked.groupId);
+    const where = account ? account.email : group ? `the accounts in ${group.name}` : accountsRef.current.length > 1 ? "all your accounts" : "this account";
+    setAsk({
+      title: "Empty Trash?",
+      body: `Everything in Trash for ${where} will be deleted for good. This can't be undone.`,
+      confirmLabel: "Empty Trash",
+      run: () => void runEmptyTrash(asked),
+    });
+  }
+
+  async function runEmptyTrash(asked: MailQuery) {
+    const scope = groupScope(asked);
+    const inScope = (accountId: string) => (scope ? scope.includes(accountId) : !asked.accountId || asked.accountId === accountId);
+    try {
+      if (modeRef.current === "demo" && demoRef.current) {
+        demoRef.current.messages = demoRef.current.messages.filter((message) => !(inScope(message.accountId) && message.labelIds.includes("TRASH")));
+        closeThread();
+        publishDemo();
+        toast("Trash emptied");
+      } else if (modeRef.current === "live") {
+        toast("Emptying Trash…");
+        const removed = await api.trashEmpty(asked.accountId, scope);
+        setChecked([]);
+        if (queryRef.current.folder === "trash") closeThread();
+        await reloadLive();
+        toast(removed > 0 ? `Deleted ${removed.toLocaleString()} ${removed === 1 ? "message" : "messages"} for good` : "Trash was already empty");
+      }
+    } catch (error) {
+      toast(messageOf(error));
+      if (modeRef.current === "live") void reloadLive().catch(() => {});
+    }
+  }
+
+  async function saveLocalLabel(label: { id: string; name: string; color: string }): Promise<string> {
+    if (modeRef.current !== "live") return "Novabox labels need a signed-in account. The sample inbox doesn't keep them.";
+    try {
+      await api.localLabelSave(label);
+      await reloadLive();
+      return "";
+    } catch (error) {
+      return messageOf(error);
+    }
+  }
+
+  function deleteLocalLabel(label: LocalLabel) {
+    setAsk({
+      title: `Delete the label "${label.name}"?`,
+      body: "It comes off every conversation it is on. The mail itself is not touched, and nothing changes in Gmail or on your mail server.",
+      confirmLabel: "Delete label",
+      run: () => {
+        void (async () => {
+          try {
+            await api.localLabelDelete(label.id);
+            if (queryRef.current.folder === "local" && queryRef.current.labelId === label.id) setFolder("inbox");
+            else await reloadLive();
+          } catch (error) {
+            toast(messageOf(error));
+          }
+        })();
+      },
+    });
+  }
+
+  async function tagThreads(labelId: string, on: boolean, targets?: ThreadTarget[]) {
+    const list = (targets && targets.length > 0 ? targets : currentTargets()).filter((target) => !target.threadId.startsWith("sched:"));
+    if (list.length === 0 || modeRef.current !== "live") return;
+    try {
+      await api.localLabelAssign(labelId, list, on);
+      await reloadLive();
+    } catch (error) {
+      toast(messageOf(error));
+    }
+  }
+
   async function undoAct() {
     if (!undo) return;
     const current = undo;
@@ -762,7 +895,7 @@ export function MailProvider({ children }: { children: ReactNode }) {
       const shown = prefs.popupPreview || !hidden[notice.kind] ? notice : { ...notice, sender: null, body: hidden[notice.kind] };
       void api.popupPush(shown, prefs.popupCorner || "bottomRight", prefs.popupMax || 3).catch((error: unknown) => console.error(error));
     } else {
-      void api.notifyShow(notice.title, notice.body).catch((error: unknown) => console.error(error));
+      void api.notifyShow(notice).catch((error: unknown) => console.error(error));
     }
   }
   deliverRef.current = deliver;
@@ -790,8 +923,13 @@ export function MailProvider({ children }: { children: ReactNode }) {
   function openNotice(notice: Notice) {
     dismissNotice(notice.id);
     const { accountId, threadId } = notice;
-    if (!accountId || !threadId) return;
+    if (!accountId) return;
     setSettingsOpen(false);
+    if (!threadId) {
+      // Several messages arrived at once, so there is no one conversation: show that inbox.
+      if (box.accounts.some((item) => item.id === accountId)) selectAccount(accountId);
+      return;
+    }
     const listed = threadsRef.current.find((item) => item.accountId === accountId && item.threadId === threadId);
     const account = box.accounts.find((item) => item.id === accountId);
     void openThread(
@@ -1366,6 +1504,14 @@ export function MailProvider({ children }: { children: ReactNode }) {
     mode,
     accounts: box.accounts,
     labels: box.labels,
+    localLabels: box.localLabels ?? [],
+    ask,
+    closeAsk: () => setAsk(null),
+    deleteForever,
+    emptyTrash,
+    saveLocalLabel,
+    deleteLocalLabel,
+    tagThreads,
     threads: visibleThreads,
     hasMore: remoteThreads ? false : box.hasMore,
     total: remoteThreads ? remoteThreads.length : box.total,

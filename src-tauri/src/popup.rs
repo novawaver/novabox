@@ -223,10 +223,14 @@ pub fn popup_open(app: AppHandle, notice: Value) {
     if let Some(id) = notice.get("id").and_then(|v| v.as_str()) {
         popup_dismiss(app.clone(), id.to_string());
     }
-    if let Some(main) = app.get_webview_window("main") {
-        let _ = main.unminimize();
-        let _ = main.show();
-        let _ = main.set_focus();
+    open_notice(&app, notice);
+}
+
+/// Brings the main window forward, out of the tray if need be, and has it open the
+/// notice's conversation. Used by a click on either kind of desktop notification.
+pub fn open_notice(app: &AppHandle, notice: Value) {
+    crate::reveal(app);
+    if !notice.is_null() {
+        let _ = app.emit_to("main", "popup://open", notice);
     }
-    let _ = app.emit_to("main", "popup://open", notice);
 }

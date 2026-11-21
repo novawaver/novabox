@@ -9,6 +9,7 @@ use tauri::{Emitter, Manager, WindowEvent};
 
 mod auth;
 mod backup;
+mod badge;
 mod commands;
 mod db;
 mod files;
@@ -41,6 +42,8 @@ pub(crate) struct AppState {
     /// Set while an older mailbox gets its list indexes; the database is busy until it clears.
     pub preparing: AtomicBool,
     pub close_to_tray: AtomicBool,
+    /// The unread count now drawn on the taskbar button and tray icon.
+    pub badge_shown: std::sync::atomic::AtomicI64,
     pub due_running: AtomicBool,
     pub sign_in_cancel: Arc<AtomicBool>,
 }
@@ -69,14 +72,18 @@ pub fn refresh_badge(app: &tauri::AppHandle) {
         };
         let _ = tray.set_tooltip(Some(tip));
     }
+    badge::show(app, unread, false);
 }
 
-fn reveal(app: &tauri::AppHandle) {
+pub(crate) fn reveal(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
     }
+    // The taskbar button is new each time the window comes back from the tray.
+    let unread = app.state::<AppState>().badge_shown.load(std::sync::atomic::Ordering::Relaxed);
+    badge::show(app, unread, true);
 }
 
 fn setup_tray(app: &tauri::App) -> bool {
@@ -185,6 +192,7 @@ pub fn run() {
                 sync_all_running: AtomicBool::new(false),
                 preparing: AtomicBool::new(prepare),
                 close_to_tray: AtomicBool::new(false),
+                badge_shown: std::sync::atomic::AtomicI64::new(0),
                 due_running: AtomicBool::new(false),
                 sign_in_cancel: Arc::new(AtomicBool::new(false)),
             });
@@ -273,6 +281,11 @@ pub fn run() {
             commands::account_remove,
             commands::account_set_signature,
             commands::threads_modify,
+            commands::threads_delete,
+            commands::trash_empty,
+            commands::local_label_save,
+            commands::local_label_delete,
+            commands::local_label_assign,
             commands::mail_send,
             commands::draft_save,
             commands::draft_delete,

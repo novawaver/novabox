@@ -8,7 +8,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use crate::model::{
-    Account, AttachmentMeta, ComposeRequest, FolderCounts, InboxTabs, Label, Mailbox, MessageDetail, SendAs,
+    Account, AttachmentMeta, ComposeRequest, FolderCounts, InboxTabs, Label, LocalLabel, Mailbox, MessageDetail, SendAs,
     StoredMessage, Template, ThreadDetail, ThreadQuery, ThreadSummary,
 };
 
@@ -157,7 +157,92 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
     if version < reached {
         conn.pragma_update(None, "user_version", reached).map_err(|e| e.to_string())?;
     }
+    // Small tables that any version may be missing; making them costs nothing.
+    conn.execute_batch(LOCAL_LABEL_TABLES)
+        .map_err(|e| format!("Could not prepare Novabox labels: {e}"))?;
     Ok(())
+}
+
+const LOCAL_LABEL_TABLES: &str = "
+CREATE TABLE IF NOT EXISTS local_labels (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    color TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS local_label_threads (
+    label_id TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    PRIMARY KEY (label_id, account_id, thread_id)
+);";
+
+pub fn local_labels_list(conn: &Connection) -> Result<Vec<LocalLabel>, String> {
+    let mut stmt = conn
+        .prepare_cached("SELECT id, name, color FROM local_labels ORDER BY name COLLATE NOCASE, id")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(LocalLabel { id: row.get(0)?, name: row.get(1)?, color: row.get(2)?, total: 0, unread: 0 })
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
+pub fn local_label_save(conn: &Connection, label: &LocalLabel) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO local_labels (id, name, color, created_at) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(id) DO UPDATE SET name = excluded.name, color = excluded.color",
+        params![label.id, label.name, label.color, crate::util::now_secs()],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn local_label_delete(conn: &Connection, id: &str) -> Result<(), String> {
+    conn.execute("DELETE FROM local_label_threads WHERE label_id = ?1", [id]).map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM local_labels WHERE id = ?1", [id]).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Puts a Novabox label on a conversation, or takes it off.
+pub fn local_label_assign(conn: &Connection, label_id: &str, account_id: &str, thread_id: &str, on: bool) -> Result<(), String> {
+    let sql = if on {
+        "INSERT OR IGNORE INTO local_label_threads (label_id, account_id, thread_id) VALUES (?1, ?2, ?3)"
+    } else {
+        "DELETE FROM local_label_threads WHERE label_id = ?1 AND account_id = ?2 AND thread_id = ?3"
+    };
+    conn.execute(sql, params![label_id, account_id, thread_id]).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Every (label, account, conversation) a Novabox label is on.
+fn local_label_threads(conn: &Connection) -> Result<Vec<(String, String, String)>, String> {
+    let mut stmt = conn
+        .prepare_cached("SELECT label_id, account_id, thread_id FROM local_label_threads")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
+/// The messages of a conversation that are in Trash.
+pub fn trashed_in_thread(conn: &Connection, account_id: &str, thread_id: &str) -> Result<Vec<String>, String> {
+    Ok(thread_labels(conn, account_id, thread_id)?
+        .into_iter()
+        .filter(|(_, labels)| has_label(labels, "TRASH"))
+        .map(|(id, _)| id)
+        .collect())
+}
+
+/// Removes messages from this PC in one go. Their cached files are the caller's to remove.
+pub fn delete_messages(conn: &Connection, account_id: &str, ids: &[String]) -> Result<(), String> {
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    for id in ids {
+        delete_message(&tx, account_id, id)?;
+    }
+    tx.commit().map_err(|e| e.to_string())
 }
 
 const LIST_VERSION: i64 = 5;
@@ -336,6 +421,7 @@ pub fn delete_account(conn: &Connection, account_id: &str) -> Result<(), String>
     tx.execute("DELETE FROM labels WHERE account_id = ?1", [account_id]).map_err(|e| e.to_string())?;
     tx.execute("DELETE FROM snoozes WHERE account_id = ?1", [account_id]).map_err(|e| e.to_string())?;
     tx.execute("DELETE FROM scheduled_mail WHERE account_id = ?1", [account_id]).map_err(|e| e.to_string())?;
+    tx.execute("DELETE FROM local_label_threads WHERE account_id = ?1", [account_id]).map_err(|e| e.to_string())?;
     tx.execute("DELETE FROM accounts WHERE id = ?1", [account_id]).map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
     Ok(())
@@ -922,6 +1008,26 @@ pub fn query_mailbox(conn: &Connection, query: &ThreadQuery) -> Result<Mailbox, 
             .copied()
             .unwrap_or(0);
     }
+    let mut local_labels = local_labels_list(conn)?;
+    let tagged = tagged_places(conn, &local_labels, &owners, &loaded)?;
+    for (place, on) in &tagged {
+        let live = |message: &&Lean| message.flags & (TRASH | SPAM) == 0;
+        let messages = loaded.messages_of(&conversations[*place]);
+        if !messages.iter().any(|message| live(&message)) {
+            continue;
+        }
+        let unread = messages.iter().filter(live).any(|message| message.flags & UNREAD != 0);
+        for label in on {
+            local_labels[*label].total += 1;
+            local_labels[*label].unread += unread as i64;
+        }
+    }
+    let local_ids = |place: usize| -> Vec<String> {
+        tagged
+            .get(&place)
+            .map(|on| on.iter().map(|label| local_labels[*label].id.clone()).collect())
+            .unwrap_or_default()
+    };
     let search = query.search.as_deref().unwrap_or("").trim().to_string();
     let offset = query.offset.max(0) as usize;
     let limit = query.limit.clamp(1, 200) as usize;
@@ -929,9 +1035,20 @@ pub fn query_mailbox(conn: &Connection, query: &ThreadQuery) -> Result<Mailbox, 
         let threads = scheduled_threads(&scheduled, &account_pairs(&accounts));
         let total = threads.len();
         let threads = threads.into_iter().skip(offset).take(limit).collect();
-        return Ok(Mailbox { accounts, labels, threads, has_more: total > offset + limit, total, counts });
+        return Ok(Mailbox { accounts, labels, local_labels, threads, has_more: total > offset + limit, total, counts });
     }
-    let lines = if query.folder == "snoozed" && search.is_empty() {
+    let lines = if query.folder == "local" && search.is_empty() {
+        // A Novabox label: its conversations, wherever their mail is, short of Trash and Spam.
+        let wanted = query
+            .label_id
+            .as_deref()
+            .and_then(|id| local_labels.iter().position(|label| label.id == id));
+        summarize(
+            &loaded,
+            |place| wanted.is_some_and(|wanted| tagged.get(&place).is_some_and(|on| on.contains(&wanted))),
+            |message| message.flags & (TRASH | SPAM) == 0,
+        )
+    } else if query.folder == "snoozed" && search.is_empty() {
         let mut lines = summarize(&loaded, |place| snoozed.contains_key(&place), |_| true);
         lines.retain(|line| line.latest.flags & (TRASH | SPAM) == 0);
         lines
@@ -950,7 +1067,7 @@ pub fn query_mailbox(conn: &Connection, query: &ThreadQuery) -> Result<Mailbox, 
     let total = lines.len();
     // Only the page on screen is read in full; the rest of the mailbox never leaves the index.
     let page: Vec<&Line> = lines.iter().skip(offset).take(limit).collect();
-    let mut threads = hydrate(conn, &owners, conversations, &page)?;
+    let mut threads = hydrate(conn, &owners, conversations, &page, &local_ids)?;
     if query.folder == "snoozed" && search.is_empty() {
         for (thread, line) in threads.iter_mut().zip(&page) {
             thread.snooze_until = snoozed.get(&line.conversation).copied();
@@ -959,11 +1076,36 @@ pub fn query_mailbox(conn: &Connection, query: &ThreadQuery) -> Result<Mailbox, 
     Ok(Mailbox {
         accounts,
         labels,
+        local_labels,
         threads,
         has_more: total > offset + limit,
         total,
         counts,
     })
+}
+
+/// Which Novabox labels are on which of the loaded conversations: positions in
+/// `conversations` to positions in `labels`.
+fn tagged_places(conn: &Connection, labels: &[LocalLabel], owners: &[Owner], loaded: &Loaded) -> Result<HashMap<usize, Vec<usize>>, String> {
+    let mut tagged: HashMap<usize, Vec<usize>> = HashMap::new();
+    let rows = local_label_threads(conn)?;
+    if rows.is_empty() {
+        return Ok(tagged);
+    }
+    let mut by_thread: HashMap<(usize, &str), Vec<usize>> = HashMap::new();
+    for (label_id, account_id, thread_id) in &rows {
+        let label = labels.iter().position(|label| &label.id == label_id);
+        let owner = owners.iter().position(|owner| &owner.id == account_id);
+        if let (Some(label), Some(owner)) = (label, owner) {
+            by_thread.entry((owner, thread_id.as_str())).or_default().push(label);
+        }
+    }
+    for (place, conversation) in loaded.conversations.iter().enumerate() {
+        if let Some(on) = by_thread.get(&(conversation.account, conversation.thread_id.as_str())) {
+            tagged.insert(place, on.clone());
+        }
+    }
+    Ok(tagged)
 }
 
 pub fn threads_for_messages(conn: &Connection, keys: &[(String, String)]) -> Result<Vec<ThreadSummary>, String> {
@@ -980,7 +1122,14 @@ pub fn threads_for_messages(conn: &Connection, keys: &[(String, String)]) -> Res
     }
     let lines = summarize(&found, |_| true, |_| true);
     let page: Vec<&Line> = lines.iter().take(200).collect();
-    hydrate(conn, &owners, &found.conversations, &page)
+    let local_labels = local_labels_list(conn)?;
+    let tagged = tagged_places(conn, &local_labels, &owners, &found)?;
+    hydrate(conn, &owners, &found.conversations, &page, &|place| {
+        tagged
+            .get(&place)
+            .map(|on| on.iter().map(|label| local_labels[*label].id.clone()).collect())
+            .unwrap_or_default()
+    })
 }
 
 // The unread queries below repeat the exact condition of idx_messages_unread, which is what
@@ -1424,7 +1573,13 @@ fn summarize(loaded: &Loaded, keep: impl Fn(usize) -> bool, shows: impl Fn(&Lean
 /// Reads what a row shows (sender, subject, preview) for the lines of one page. In a
 /// message's row the labels sit after the body, and reading past a long body is slow, so
 /// the labels come from the index instead.
-fn hydrate(conn: &Connection, accounts: &[Owner], conversations: &[Conversation], lines: &[&Line]) -> Result<Vec<ThreadSummary>, String> {
+fn hydrate(
+    conn: &Connection,
+    accounts: &[Owner],
+    conversations: &[Conversation],
+    lines: &[&Line],
+    local_ids: &dyn Fn(usize) -> Vec<String>,
+) -> Result<Vec<ThreadSummary>, String> {
     let mut stmt = conn
         .prepare_cached("SELECT id, from_name, from_email, subject, snippet FROM messages WHERE rowid = ?1")
         .map_err(|e| e.to_string())?;
@@ -1461,6 +1616,7 @@ fn hydrate(conn: &Connection, accounts: &[Owner], conversations: &[Conversation]
                     scheduled_id: None,
                     body_html: None,
                     preview_to: None,
+                    local_label_ids: local_ids(line.conversation),
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -1690,6 +1846,7 @@ fn scheduled_threads(items: &[ScheduledMail], accounts: &HashMap<String, (String
             scheduled_id: Some(item.id.clone()),
             body_html: Some(item.request.html.clone()),
             preview_to: Some(item.request.to.clone()),
+            local_label_ids: Vec::new(),
         });
     }
     threads
@@ -1822,6 +1979,55 @@ mod tests {
         assert_eq!(found.threads.len(), 1);
         assert_eq!(found.threads[0].subject, "Sale");
         assert!(ask(Some(vec![]), None).threads.is_empty());
+    }
+
+    #[test]
+    fn novabox_labels_and_trash() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        upsert_message(&conn, &message("a", "t1", &["INBOX", "UNREAD"], "Lease", "rent is due")).unwrap();
+        upsert_message(&conn, &message("b", "t2", &["INBOX"], "Sale", "rent reduced")).unwrap();
+        upsert_message(&conn, &message("c", "t3", &["TRASH", "UNREAD"], "Old", "gone")).unwrap();
+        upsert_message(&conn, &message("d", "t3", &["INBOX"], "Old", "kept")).unwrap();
+        let label = LocalLabel { id: "L1".into(), name: "Follow up".into(), color: "#2F7D6D".into(), total: 0, unread: 0 };
+        local_label_save(&conn, &label).unwrap();
+        for thread in ["t1", "t2"] {
+            local_label_assign(&conn, "L1", "acct", thread, true).unwrap();
+        }
+        let ask = |folder: &str, label_id: Option<&str>| {
+            query_mailbox(
+                &conn,
+                &ThreadQuery {
+                    account_id: None,
+                    account_ids: None,
+                    folder: folder.into(),
+                    label_id: label_id.map(|id| id.to_string()),
+                    category: Some("all".into()),
+                    search: None,
+                    limit: 50,
+                    offset: 0,
+                    inbox_tabs: InboxTabs::default(),
+                },
+            )
+            .unwrap()
+        };
+        let labelled = ask("local", Some("L1"));
+        assert_eq!(labelled.threads.len(), 2);
+        assert_eq!((labelled.local_labels[0].total, labelled.local_labels[0].unread), (2, 1));
+        assert!(labelled.threads.iter().all(|thread| thread.local_label_ids == vec!["L1".to_string()]));
+        // The label shows on the rows of other folders too, and comes off again.
+        let inbox = ask("inbox", None);
+        assert_eq!(inbox.threads.iter().filter(|thread| !thread.local_label_ids.is_empty()).count(), 2);
+        local_label_assign(&conn, "L1", "acct", "t2", false).unwrap();
+        assert_eq!(ask("local", Some("L1")).threads.len(), 1);
+        local_label_delete(&conn, "L1").unwrap();
+        assert!(ask("local", Some("L1")).threads.is_empty());
+        assert!(ask("inbox", None).local_labels.is_empty());
+        // Deleting for good takes only the trashed message of a conversation.
+        assert_eq!(trashed_in_thread(&conn, "acct", "t3").unwrap(), vec!["c".to_string()]);
+        delete_messages(&conn, "acct", &["c".to_string()]).unwrap();
+        assert!(ask("trash", None).threads.is_empty());
+        assert_eq!(message_count(&conn, "acct").unwrap(), 3);
     }
 
     /// Times the list queries against a real mailbox file. Point NOVABOX_BENCH_DB at a copy

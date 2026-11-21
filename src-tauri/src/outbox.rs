@@ -18,6 +18,8 @@ pub enum Job {
         change: Change,
         before: Vec<(String, Vec<String>)>,
     },
+    /// Nothing to do but report that every change queued before it has been dealt with.
+    Settled(tokio::sync::oneshot::Sender<()>),
 }
 
 pub struct Outbox(UnboundedSender<Job>);
@@ -37,8 +39,19 @@ pub fn push(app: &AppHandle, job: Job) {
     let _ = app.state::<Outbox>().0.send(job);
 }
 
+/// Waits until the changes made so far have reached the mail service (or been refused).
+/// Deleting for good goes after this, so mail just moved to Trash is really there.
+pub async fn settle(app: &AppHandle) {
+    let (done, waiting) = tokio::sync::oneshot::channel();
+    push(app, Job::Settled(done));
+    let _ = waiting.await;
+}
+
 async fn run(app: &AppHandle, job: Job) {
     match job {
+        Job::Settled(done) => {
+            let _ = done.send(());
+        }
         Job::Change { target, change, before } => match remote_change(app, &target, &change).await {
             // Applying it again undoes a sync that stored Gmail's old labels in the meantime.
             Ok(()) => {

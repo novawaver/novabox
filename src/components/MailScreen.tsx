@@ -1,6 +1,6 @@
 import { AccountRail } from "./AccountRail";
 import { ComposeDock } from "./ComposeDock";
-import { SettingsDialog } from "./Dialogs";
+import { ConfirmDialog, SettingsDialog } from "./Dialogs";
 import { LogoMark } from "./Icons";
 import { MessageList } from "./MessageList";
 import { Onboarding } from "./Onboarding";
@@ -68,6 +68,7 @@ export function MailScreen() {
       )}
       <ComposeDock />
       <SettingsDialog />
+      {mail.ask && <ConfirmDialog title={mail.ask.title} body={mail.ask.body} confirmLabel={mail.ask.confirmLabel} onConfirm={mail.ask.run} onClose={mail.closeAsk} />}
       <NoticeStack />
       {/* Starts just right of the account bar so it never covers the avatars. */}
       <div

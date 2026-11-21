@@ -1,7 +1,8 @@
-import type { ReactNode } from "react";
-import { IconBin, IconClock, IconCompose, IconDraft, IconInbox, IconLabel, IconScheduled, IconSend, IconSpam, IconStarOutline } from "./Icons";
+import { useState, type ReactNode } from "react";
+import { IconBin, IconClock, IconCompose, IconDraft, IconInbox, IconLabel, IconPencil, IconPlus, IconScheduled, IconSend, IconSpam, IconStarOutline } from "./Icons";
+import { LocalLabelDialog } from "./LocalLabelDialog";
 import { useMail } from "../state/MailProvider";
-import type { Folder } from "../types";
+import { LOCAL_LABEL_COLORS, type Folder, type LocalLabel } from "../types";
 
 const FOLDERS: { id: Folder; label: string; icon: ReactNode }[] = [
   { id: "inbox", label: "Inbox", icon: <IconInbox /> },
@@ -18,6 +19,9 @@ const FOLDERS: { id: Folder; label: string; icon: ReactNode }[] = [
 export function Sidebar({ collapsed = false }: { collapsed?: boolean }) {
   const mail = useMail();
   const userLabels = mail.labels.filter((label) => label.kind === "user");
+  // The label being edited, "new" for the create dialog, or nothing open.
+  const [editing, setEditing] = useState<LocalLabel | "new" | null>(null);
+  const live = mail.mode === "live";
   const countFor = (id: Folder) =>
     id === "inbox" ? mail.counts.inboxUnread
     : id === "drafts" ? mail.counts.drafts
@@ -51,7 +55,7 @@ export function Sidebar({ collapsed = false }: { collapsed?: boolean }) {
           onClick={() => mail.setFolder(folder.id)}
         />
       ))}
-      {userLabels.length > 0 && (collapsed ? <div className="my-2 h-px w-8 bg-line" /> : <div className="mt-4 px-3 text-xs font-semibold uppercase tracking-wide text-muted">Labels</div>)}
+      {userLabels.length > 0 && (collapsed ? <div className="my-2 h-px w-8 bg-line" /> : <div className="mt-4 px-3 text-xs font-semibold uppercase tracking-wide text-muted">Account labels</div>)}
       {userLabels.map((label) => {
         const account = mail.accounts.find((item) => item.id === label.accountId);
         return (
@@ -66,6 +70,44 @@ export function Sidebar({ collapsed = false }: { collapsed?: boolean }) {
           />
         );
       })}
+      {/* Novabox's own labels, kept on this PC and apart from the mail service's labels above. */}
+      {live && (collapsed ? (
+        mail.localLabels.length > 0 && <div className="my-2 h-px w-8 bg-line" />
+      ) : (
+        <div className="mt-4 flex items-center justify-between pl-3 pr-1">
+          <span className="text-xs font-semibold uppercase tracking-wide text-muted">Novabox labels</span>
+          <button type="button" className="icon-btn h-6 w-6" title="New Novabox label" aria-label="New Novabox label" onClick={() => setEditing("new")}>
+            <IconPlus className="h-4 w-4" />
+          </button>
+        </div>
+      ))}
+      {live && !collapsed && mail.localLabels.length === 0 && (
+        <p className="px-3 text-xs leading-5 text-muted">Labels kept only in Novabox, for any account. Use + to make one.</p>
+      )}
+      {live && mail.localLabels.map((label) => (
+        <div key={label.id} className="group relative flex flex-col">
+          <NavItem
+            collapsed={collapsed}
+            icon={<span style={{ color: label.color || LOCAL_LABEL_COLORS[0] }}><IconLabel /></span>}
+            label={label.name}
+            count={label.unread}
+            active={mail.query.folder === "local" && mail.query.labelId === label.id}
+            onClick={() => mail.setFolder("local", label.id)}
+          />
+          {!collapsed && (
+            <button
+              type="button"
+              className="absolute right-1 top-1/2 hidden h-7 w-7 -translate-y-1/2 place-items-center rounded-lg bg-side text-muted hover:text-ink group-hover:grid focus-visible:grid"
+              title={`Edit ${label.name}`}
+              aria-label={`Edit ${label.name}`}
+              onClick={() => setEditing(label)}
+            >
+              <IconPencil />
+            </button>
+          )}
+        </div>
+      ))}
+      {editing && <LocalLabelDialog label={editing === "new" ? undefined : editing} onClose={() => setEditing(null)} />}
     </nav>
   );
 }

@@ -1212,6 +1212,47 @@ fn remove_message(conn: &mut Conn, folders: &[Folder], id: &str) -> Result<(), S
     expunge(conn, &uid.to_string())
 }
 
+/// Deletes messages for good. Only ones in the Trash folder go; any other id is left alone.
+pub async fn delete_forever(app: &AppHandle, account_id: &str, ids: Vec<String>) -> Result<(), String> {
+    run(app, account_id, move |_, _, conn| {
+        let folders = list_folders(conn)?;
+        let Some(trash) = folders.iter().find(|folder| folder.role == Role::Trash) else {
+            return Ok(());
+        };
+        let mailbox = conn.session.select(&trash.name).map_err(fail)?;
+        let validity = mailbox.uid_validity.unwrap_or(0);
+        let uids: Vec<u32> = ids
+            .iter()
+            .filter_map(|id| parse_id(id))
+            .filter(|(key, stored, _)| *key == trash.key && *stored == validity)
+            .map(|(_, _, uid)| uid)
+            .collect();
+        if uids.is_empty() {
+            return Ok(());
+        }
+        expunge(conn, &uid_set(&uids))
+    })
+    .await
+}
+
+/// Deletes everything in the Trash folder for good.
+pub async fn empty_trash(app: &AppHandle, account_id: &str) -> Result<(), String> {
+    run(app, account_id, |_, _, conn| {
+        let folders = list_folders(conn)?;
+        let Some(trash) = folders.iter().find(|folder| folder.role == Role::Trash) else {
+            return Ok(());
+        };
+        let mailbox = conn.session.select(&trash.name).map_err(fail)?;
+        if mailbox.exists == 0 {
+            return Ok(());
+        }
+        conn.session.store("1:*", "+FLAGS.SILENT (\\Deleted)").map_err(fail)?;
+        conn.session.expunge().map_err(fail)?;
+        Ok(())
+    })
+    .await
+}
+
 // ---------------------------------------------------------------------------------------
 // Sending and drafts
 // ---------------------------------------------------------------------------------------

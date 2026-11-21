@@ -22,11 +22,35 @@ export function IconCompose() {
 export function IconRefresh() {
   return <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 12a9 9 0 1 1-2.6-6.4L21 8" /><path d="M21 3v5h-5" /></svg>;
 }
-export function IconArchive() {
-  return <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 7h18" /><path d="M5 7v12h14V7" /><path d="M10 11h4" /></svg>;
+const actionStroke = { fill: "none", stroke: "currentColor", strokeWidth: 1.8, strokeLinecap: "round", strokeLinejoin: "round" } as const;
+
+/** A storage box: a lid, the box under it, and its handle slot. */
+export function IconArchive({ className = "h-[18px] w-[18px]" }: { className?: string }) {
+  return <svg viewBox="0 0 24 24" className={className} {...actionStroke}><rect x="3" y="4" width="18" height="5" rx="1.5" /><path d="M5 9v9a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9" /><path d="M10 13h4" /></svg>;
 }
-export function IconTrash() {
-  return <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2"><path d="M4 7h16" /><path d="M9 7V4h6v3" /><path d="M8 7l1 13h6l1-13" /></svg>;
+/** A bin with its lid, handle and ribs. */
+export function IconTrash({ className = "h-[18px] w-[18px]" }: { className?: string }) {
+  return <svg viewBox="0 0 24 24" className={className} {...actionStroke}><path d="M4 7h16" /><path d="M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" /><path d="M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12" /><path d="M10 11v6M14 11v6" /></svg>;
+}
+/** A closed envelope, for marking mail unread. */
+export function IconUnread({ className = "h-[18px] w-[18px]" }: { className?: string }) {
+  return <svg viewBox="0 0 24 24" className={className} {...actionStroke}><rect x="3" y="5" width="18" height="14" rx="2" /><path d="m3.5 7.5 8.5 6 8.5-6" /></svg>;
+}
+/** An opened envelope, for marking mail read. */
+export function IconRead({ className = "h-[18px] w-[18px]" }: { className?: string }) {
+  return <svg viewBox="0 0 24 24" className={className} {...actionStroke}><path d="M3 10.5 12 4l9 6.5V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" /><path d="m3.5 11 8.5 5.5 8.5-5.5" /></svg>;
+}
+/** A pencil, for editing. */
+export function IconPencil({ className = "h-[14px] w-[14px]" }: { className?: string }) {
+  return <svg viewBox="0 0 24 24" className={className} {...actionStroke}><path d="M4 20h4L19 9l-4-4L4 16Z" /><path d="m13.5 6.5 4 4" /></svg>;
+}
+/** A bin with a cross in it, for deleting for good. */
+export function IconTrashForever({ className = "h-[18px] w-[18px]" }: { className?: string }) {
+  return <svg viewBox="0 0 24 24" className={className} {...actionStroke}><path d="M4 7h16" /><path d="M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" /><path d="M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12" /><path d="m10 11.5 4 4M14 11.5l-4 4" /></svg>;
+}
+/** An arrow curving back, for restoring mail from Trash. */
+export function IconRestore({ className = "h-[18px] w-[18px]" }: { className?: string }) {
+  return <svg viewBox="0 0 24 24" className={className} {...actionStroke}><path d="M4 9h10a5 5 0 0 1 0 10H8" /><path d="M8 5 4 9l4 4" /></svg>;
 }
 export function IconStar({ filled = false }: { filled?: boolean }) {
   return <svg viewBox="0 0 24 24" className={`h-4 w-4 ${filled ? "fill-star text-star" : ""}`} fill={filled ? "currentColor" : "none"} stroke="currentColor" strokeWidth="2"><path d="m12 3 2.7 5.5L21 9.2l-4.5 4.4 1.1 6.4L12 17l-5.6 3 1.1-6.4L3 9.2l6.3-.7L12 3Z" /></svg>;

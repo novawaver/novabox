@@ -17,7 +17,7 @@ use crate::outbox::{self, Job};
 use rand::RngCore;
 
 use crate::model::{
-    Account, Address, AppInfo, AttachmentData, AttachmentRequest, ComposeRequest, Mailbox,
+    Account, Address, AppInfo, AttachmentData, AttachmentRequest, ComposeRequest, LocalLabel, Mailbox,
     ModifyBatch, PasswordSignIn, SaveAttachmentRequest, SendResult, Settings, SignatureUpdate,
     StoredMessage, Template, ThreadDetail, ThreadQuery, ThreadTarget,
 };
@@ -272,6 +272,170 @@ pub async fn threads_modify(app: AppHandle, batch: ModifyBatch) -> Result<(), St
         }
     }
     crate::refresh_badge(&app);
+    let _ = app.emit("mail://updated", json!({}));
+    Ok(())
+}
+
+/// Deletes the trashed messages of these conversations for good, on the mail service and
+/// here. Messages of a conversation that are not in Trash stay.
+#[tauri::command]
+pub async fn threads_delete(app: AppHandle, targets: Vec<ThreadTarget>) -> Result<(), String> {
+    outbox::settle(&app).await;
+    let mut accounts: Vec<String> = Vec::new();
+    for target in &targets {
+        if !accounts.contains(&target.account_id) {
+            accounts.push(target.account_id.clone());
+        }
+    }
+    let data_dir = app.state::<AppState>().data_dir.clone();
+    let mut result = Ok(());
+    for account_id in accounts {
+        let threads: Vec<&ThreadTarget> = targets.iter().filter(|target| target.account_id == account_id).collect();
+        let ids = with_db(&app, |conn| {
+            let mut ids = Vec::new();
+            for target in &threads {
+                ids.extend(db::trashed_in_thread(conn, &account_id, &target.thread_id)?);
+            }
+            Ok(ids)
+        })?;
+        if ids.is_empty() {
+            continue;
+        }
+        let deleted = if imap::uses(&app, &account_id) {
+            imap::delete_forever(&app, &account_id, ids.clone()).await
+        } else {
+            gmail::delete_messages(&app, &account_id, &ids).await
+        };
+        // One account refusing should not stop the others; its mail simply stays in Trash.
+        if let Err(err) = deleted {
+            result = Err(err);
+            continue;
+        }
+        forget_messages(&app, &data_dir, &account_id, &ids)?;
+    }
+    crate::refresh_badge(&app);
+    let _ = app.emit("mail://updated", json!({}));
+    result
+}
+
+/// Empties Trash for one account, a group of accounts, or (with neither) every account.
+/// Returns how many messages were removed from this PC.
+#[tauri::command]
+pub async fn trash_empty(app: AppHandle, account_id: Option<String>, account_ids: Option<Vec<String>>) -> Result<u32, String> {
+    outbox::settle(&app).await;
+    let accounts: Vec<String> = match (account_ids, account_id.filter(|id| !id.is_empty())) {
+        (Some(ids), _) => ids,
+        (None, Some(id)) => vec![id],
+        (None, None) => with_db(&app, db::list_accounts)?.into_iter().map(|account| account.id).collect(),
+    };
+    let data_dir = app.state::<AppState>().data_dir.clone();
+    let mut removed = 0u32;
+    let mut result = Ok(());
+    for account_id in accounts {
+        let mut ids: Vec<String> = with_db(&app, |conn| db::ids_with_label(conn, &account_id, "TRASH"))?
+            .into_iter()
+            .collect();
+        let emptied = if imap::uses(&app, &account_id) {
+            imap::empty_trash(&app, &account_id).await
+        } else {
+            // Trash on Google can hold more than has been downloaded, so ask it for the list.
+            match gmail_trash_ids(&app, &account_id).await {
+                Ok(listed) => {
+                    for id in listed {
+                        if !ids.contains(&id) {
+                            ids.push(id);
+                        }
+                    }
+                    gmail::delete_messages(&app, &account_id, &ids).await
+                }
+                Err(err) => Err(err),
+            }
+        };
+        if let Err(err) = emptied {
+            result = Err(err);
+            continue;
+        }
+        removed += ids.len() as u32;
+        forget_messages(&app, &data_dir, &account_id, &ids)?;
+    }
+    crate::refresh_badge(&app);
+    let _ = app.emit("mail://updated", json!({}));
+    result.map(|_| removed)
+}
+
+async fn gmail_trash_ids(app: &AppHandle, account_id: &str) -> Result<Vec<String>, String> {
+    let mut ids = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        let (page, next) = gmail::list_label_ids_wide(app, account_id, "TRASH", token.as_deref()).await?;
+        ids.extend(page);
+        match next {
+            Some(next) => token = Some(next),
+            None => return Ok(ids),
+        }
+    }
+}
+
+/// Removes messages that are gone from the mail service from this PC as well.
+fn forget_messages(app: &AppHandle, data_dir: &std::path::Path, account_id: &str, ids: &[String]) -> Result<(), String> {
+    with_db(app, |conn| db::delete_messages(conn, account_id, ids))?;
+    for id in ids {
+        files::remove_message_files(data_dir, account_id, id);
+    }
+    Ok(())
+}
+
+/// Creates a Novabox label (no id yet) or renames and recolours one.
+#[tauri::command]
+pub fn local_label_save(app: AppHandle, label: LocalLabel) -> Result<LocalLabel, String> {
+    let name = label.name.trim();
+    if name.is_empty() || name.chars().count() > 40 {
+        return Err("Give the label a name of up to 40 characters.".into());
+    }
+    let color = label.color.trim();
+    let hex = color.len() == 7 && color.starts_with('#') && color[1..].chars().all(|ch| ch.is_ascii_hexdigit());
+    if !color.is_empty() && !hex {
+        return Err("That label colour is not valid.".into());
+    }
+    let saved = LocalLabel {
+        id: if label.id.trim().is_empty() { local_id() } else { label.id.clone() },
+        name: name.to_string(),
+        color: color.to_string(),
+        total: 0,
+        unread: 0,
+    };
+    with_db(&app, |conn| {
+        let taken = db::local_labels_list(conn)?
+            .into_iter()
+            .any(|other| other.id != saved.id && other.name.eq_ignore_ascii_case(&saved.name));
+        if taken {
+            return Err("There is already a Novabox label with that name.".into());
+        }
+        db::local_label_save(conn, &saved)
+    })?;
+    let _ = app.emit("mail://updated", json!({}));
+    Ok(saved)
+}
+
+#[tauri::command]
+pub fn local_label_delete(app: AppHandle, id: String) -> Result<(), String> {
+    with_db(&app, |conn| db::local_label_delete(conn, &id))?;
+    let _ = app.emit("mail://updated", json!({}));
+    Ok(())
+}
+
+/// Puts a Novabox label on conversations (`on`) or takes it off them.
+#[tauri::command]
+pub fn local_label_assign(app: AppHandle, label_id: String, targets: Vec<ThreadTarget>, on: bool) -> Result<(), String> {
+    with_db(&app, |conn| {
+        if !db::local_labels_list(conn)?.iter().any(|label| label.id == label_id) {
+            return Err("That Novabox label no longer exists.".into());
+        }
+        for target in &targets {
+            db::local_label_assign(conn, &label_id, &target.account_id, &target.thread_id, on)?;
+        }
+        Ok(())
+    })?;
     let _ = app.emit("mail://updated", json!({}));
     Ok(())
 }

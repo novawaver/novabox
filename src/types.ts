@@ -41,6 +41,18 @@ export type Label = {
   unread: number;
 };
 
+/** A label that exists only in Novabox on this PC, put on whole conversations of any account. */
+export type LocalLabel = {
+  id: string;
+  name: string;
+  color: string;
+  /** Conversations under the label, and how many of them have unread mail. */
+  total: number;
+  unread: number;
+};
+
+export const LOCAL_LABEL_COLORS = ["#C9842A", "#2F7D6D", "#3D5A80", "#8A4E7A", "#C4535A", "#3E6B8A", "#6B7A2F", "#6B5B47"];
+
 export type Address = {
   name: string;
   email: string;
@@ -73,6 +85,8 @@ export type ThreadSummary = {
   scheduledId?: string | null;
   bodyHtml?: string | null;
   previewTo?: string | null;
+  /** Ids of the Novabox labels on the conversation. */
+  localLabelIds?: string[];
 };
 
 export type Template = {
@@ -170,13 +184,15 @@ export type FolderCounts = {
 export type Mailbox = {
   accounts: Account[];
   labels: Label[];
+  localLabels?: LocalLabel[];
   threads: ThreadSummary[];
   hasMore: boolean;
   total: number;
   counts: FolderCounts;
 };
 
-export type Folder = "inbox" | "starred" | "sent" | "drafts" | "snoozed" | "scheduled" | "spam" | "trash" | "label";
+/** "label" is a label of the mail service; "local" is a Novabox label. Both use `labelId`. */
+export type Folder = "inbox" | "starred" | "sent" | "drafts" | "snoozed" | "scheduled" | "spam" | "trash" | "label" | "local";
 export type Category = "all" | "primary" | "promotions" | "social" | "updates";
 
 export type MailQuery = {

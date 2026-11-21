@@ -305,6 +305,29 @@ pub async fn untrash_thread(app: &AppHandle, account_id: &str, thread_id: &str) 
     Ok(())
 }
 
+/// Deletes messages for good; they do not pass through Trash and cannot be brought back.
+/// Needs the full-mailbox permission, which sign-ins from before Novabox could delete lack.
+pub async fn delete_messages(app: &AppHandle, account_id: &str, ids: &[String]) -> Result<(), String> {
+    for chunk in ids.chunks(1000) {
+        let sent = gmail(
+            app,
+            account_id,
+            Method::POST,
+            users("messages/batchDelete"),
+            Some(json!({ "ids": chunk })),
+        )
+        .await;
+        match sent {
+            Ok(_) => {}
+            Err(err) if err.contains("403") && err.to_lowercase().contains("insufficient") => {
+                return Err("Google has not given Novabox permission to delete mail for good on this account. Sign in to the account again with the + button to allow it, then try again.".into());
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
 pub async fn send_raw(
     app: &AppHandle,
     account_id: &str,

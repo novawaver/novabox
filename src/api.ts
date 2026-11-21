@@ -4,6 +4,7 @@ import type {
   AppInfo,
   ComposeDraft,
   InboxTabs,
+  LocalLabel,
   Mailbox,
   MailQuery,
   Notice,
@@ -29,7 +30,7 @@ function assertDesktop(): void {
 export const api = {
   appInfo: () => invoke<AppInfo>("app_info"),
   settingsGet: () => invoke<Settings>("settings_get"),
-  notifyShow: (title: string, body: string) => invoke<void>("notify_show", { title, body }),
+  notifyShow: (notice: Notice) => invoke<void>("notify_show", { title: notice.title, body: notice.body, notice }),
   popupPush: (notice: Notice, corner: string, max: number) => invoke<void>("popup_push", { notice, corner, max }),
   popupList: () => invoke<PopupSnapshot>("popup_list"),
   popupLayout: (height: number) => invoke<void>("popup_layout", { height }),
@@ -68,6 +69,11 @@ export const api = {
     invoke<void>("account_set_signature", { update: { accountId, signature } }),
   threadsModify: (targets: ThreadTarget[], action: string, labelId?: string) =>
     invoke<void>("threads_modify", { batch: { targets, action, labelId: labelId ?? null } }),
+  threadsDelete: (targets: ThreadTarget[]) => invoke<void>("threads_delete", { targets }),
+  trashEmpty: (accountId: string | null, accountIds: string[] | null) => invoke<number>("trash_empty", { accountId, accountIds }),
+  localLabelSave: (label: { id: string; name: string; color: string }) => invoke<LocalLabel>("local_label_save", { label }),
+  localLabelDelete: (id: string) => invoke<void>("local_label_delete", { id }),
+  localLabelAssign: (labelId: string, targets: ThreadTarget[], on: boolean) => invoke<void>("local_label_assign", { labelId, targets, on }),
   mailSend: (draft: ComposeDraft) => invoke<SendResult>("mail_send", { request: composePayload(draft) }),
   draftSave: (draft: ComposeDraft) => invoke<SendResult>("draft_save", { request: composePayload(draft) }),
   draftDelete: (accountId: string, draftId: string) => invoke<void>("draft_delete", { accountId, draftId }),

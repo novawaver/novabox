@@ -115,6 +115,25 @@ pub struct ThreadSummary {
     pub body_html: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preview_to: Option<String>,
+    /// The Novabox labels on the conversation (see `LocalLabel`).
+    pub local_label_ids: Vec<String>,
+}
+
+/// A label that exists only in Novabox on this PC. It is put on whole conversations, of any
+/// account, and the mail service never hears of it; the service's own labels are `Label`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalLabel {
+    #[serde(default)]
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub color: String,
+    /// Conversations under the label, and how many of them have unread mail.
+    #[serde(default)]
+    pub total: i64,
+    #[serde(default)]
+    pub unread: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -251,6 +270,7 @@ pub struct FolderCounts {
 pub struct Mailbox {
     pub accounts: Vec<Account>,
     pub labels: Vec<Label>,
+    pub local_labels: Vec<LocalLabel>,
     pub threads: Vec<ThreadSummary>,
     pub has_more: bool,
     pub total: usize,

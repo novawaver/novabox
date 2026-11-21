@@ -1,9 +1,10 @@
 import { formatListDate, personName, threadKey } from "../format";
-import { IconArchive, IconBack, IconNext, IconPaperclip, IconRefresh, IconStar, IconTrash } from "./Icons";
+import { IconArchive, IconBack, IconNext, IconPaperclip, IconRead, IconRefresh, IconRestore, IconStar, IconTrash, IconTrashForever, IconUnread } from "./Icons";
+import { LocalLabelDialog } from "./LocalLabelDialog";
 import { WhenMenu } from "./WhenMenu";
 import { useMail } from "../state/MailProvider";
-import { defaultInboxTabs, isGoogle, type Category, type InboxTabs } from "../types";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { defaultInboxTabs, isGoogle, LOCAL_LABEL_COLORS, type Category, type InboxTabs } from "../types";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { useDismiss } from "../useDismiss";
 
 const TABS: { id: Category; label: string }[] = [
@@ -48,6 +49,15 @@ export function MessageList({ className = "" }: { className?: string }) {
   const labelAccount = accountIds.size === 1 ? [...accountIds][0] : mail.query.accountId;
   const labelChoices = mail.labels.filter((label) => label.kind === "user" && (!labelAccount || label.accountId === labelAccount));
   const inTrash = mail.query.folder === "trash";
+  const [newLabel, setNewLabel] = useState(false);
+  const localLabels = mail.mode === "live" ? mail.localLabels : [];
+  // The rows the toolbar acts on, to tell which Novabox labels they all carry already.
+  const targetRows = mail.threads.filter((item) =>
+    mail.checked.length > 0
+      ? mail.checked.includes(threadKey(item.accountId, item.threadId))
+      : mail.thread?.accountId === item.accountId && mail.thread.threadId === item.threadId,
+  );
+  const carried = (labelId: string) => targetRows.length > 0 && targetRows.every((item) => item.localLabelIds?.includes(labelId));
   // Only Gmail empties Trash on a schedule Novabox knows; other services set their own.
   const trashExpires = mail.accounts.some((account) => isGoogle(account) && (!mail.query.accountId || account.id === mail.query.accountId));
   const pageStart = mail.threads.length > 0 ? mail.query.offset + 1 : 0;
@@ -80,7 +90,10 @@ export function MessageList({ className = "" }: { className?: string }) {
         <button type="button" className="icon-btn" aria-label="Refresh" onClick={() => void mail.refresh()}><IconRefresh /></button>
         <button type="button" className="icon-btn" aria-label="Archive" title="Archive" disabled={!hasTargets} onClick={() => void mail.act("archive")}><IconArchive /></button>
         {inTrash ? (
-          <button type="button" className="tool-btn" title="Move back to the inbox" disabled={!hasTargets} onClick={() => void mail.act("untrash")}>Restore</button>
+          <>
+            <button type="button" className="tool-btn" title="Move back to the inbox" disabled={!hasTargets} onClick={() => void mail.act("untrash")}>Restore</button>
+            <button type="button" className="tool-btn hover:text-danger" title="Delete for good. This can't be undone." disabled={!hasTargets} onClick={() => mail.deleteForever()}>Delete forever</button>
+          </>
         ) : (
           <button type="button" className="icon-btn" aria-label="Delete" title="Move to Trash" disabled={!hasTargets} onClick={() => void mail.act("trash")}><IconTrash /></button>
         )}
@@ -97,7 +110,44 @@ export function MessageList({ className = "" }: { className?: string }) {
         <div className="relative">
           <button type="button" className={`tool-btn ${menu === "label" ? "bg-hover text-ink" : ""}`} aria-label="Label" aria-expanded={menu === "label"} disabled={!hasTargets} onClick={() => setMenu((open) => (open === "label" ? null : "label"))}>Label</button>
           {menu === "label" && (
-            <div className="absolute left-0 top-9 z-20 w-56 rounded-xl border border-line bg-panel p-2 shadow-[var(--shadow)]">
+            <div className="absolute left-0 top-9 z-20 max-h-[70vh] w-60 overflow-y-auto rounded-xl border border-line bg-panel p-2 shadow-[var(--shadow)]">
+              {mail.mode === "live" && (
+                <>
+                  <p className="px-2 pb-1 text-xs font-semibold uppercase tracking-wide text-muted">Novabox labels</p>
+                  {localLabels.map((label) => {
+                    const on = carried(label.id);
+                    return (
+                      <button
+                        key={label.id}
+                        type="button"
+                        role="menuitemcheckbox"
+                        aria-checked={on}
+                        className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-sm hover:bg-hover"
+                        onClick={() => {
+                          setMenu(null);
+                          void mail.tagThreads(label.id, !on);
+                        }}
+                      >
+                        <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ background: label.color || LOCAL_LABEL_COLORS[0] }} aria-hidden />
+                        <span className="min-w-0 flex-1 truncate">{label.name}</span>
+                        {on && <span aria-hidden>✓</span>}
+                      </button>
+                    );
+                  })}
+                  <button
+                    type="button"
+                    className="block w-full rounded-lg px-2 py-1.5 text-left text-sm text-accent hover:bg-hover"
+                    onClick={() => {
+                      setMenu(null);
+                      setNewLabel(true);
+                    }}
+                  >
+                    New Novabox label…
+                  </button>
+                  <div className="my-2 h-px bg-line" />
+                  <p className="px-2 pb-1 text-xs font-semibold uppercase tracking-wide text-muted">Account labels</p>
+                </>
+              )}
               {labelChoices.length === 0 && <p className="px-2 py-1 text-sm text-muted">No labels for this selection.</p>}
               {labelChoices.map((label) => (
                 <button
@@ -126,9 +176,15 @@ export function MessageList({ className = "" }: { className?: string }) {
           </div>
         )}
       </div>
-      {inTrash && trashExpires && (
-        <p className="border-b border-line px-4 py-2 text-xs text-muted">Gmail deletes conversations in Trash for good after 30 days.</p>
+      {inTrash && (
+        <div className="flex items-center gap-3 border-b border-line px-4 py-1.5 text-xs text-muted">
+          <span>{trashExpires ? "Gmail deletes conversations in Trash for good after 30 days." : "Mail in Trash stays until you delete it for good."}</span>
+          <button type="button" className="rounded-full px-2 py-1 font-semibold text-danger hover:bg-hover disabled:opacity-40" disabled={mail.total === 0} onClick={mail.emptyTrash}>
+            Empty Trash now
+          </button>
+        </div>
       )}
+      {newLabel && <LocalLabelDialog onClose={() => setNewLabel(false)} />}
       <div className="min-h-0 flex-1 overflow-y-auto">
         {mail.listLoading && (
           <div className="grid h-full place-items-center text-muted" role="status" aria-live="polite">
@@ -149,6 +205,22 @@ export function MessageList({ className = "" }: { className?: string }) {
         {!mail.listLoading && mail.threads.map((thread, index) => {
           const key = threadKey(thread.accountId, thread.threadId);
           const active = (mail.thread?.accountId === thread.accountId && mail.thread.threadId === thread.threadId);
+          // Buttons that act on this row alone, whatever else is ticked. Shown over the date
+          // while the pointer is on the row, or while one of them has keyboard focus.
+          const rowAction = (label: string, action: string, icon: ReactNode) => (
+            <button
+              type="button"
+              className="icon-btn hover:bg-line"
+              title={label}
+              aria-label={label}
+              onClick={(event) => {
+                event.stopPropagation();
+                void mail.act(action, undefined, [{ accountId: thread.accountId, threadId: thread.threadId }]);
+              }}
+            >
+              {icon}
+            </button>
+          );
           return (
             <div
               key={key}
@@ -156,7 +228,7 @@ export function MessageList({ className = "" }: { className?: string }) {
               role="button"
               tabIndex={0}
               aria-label={thread.subject || "(no subject)"}
-              className={`mail-row grid cursor-pointer grid-cols-[28px_28px_minmax(120px,180px)_1fr_auto] items-center gap-2 border-b border-line px-2 ${active ? "bg-selected" : thread.unread ? "hover:bg-hover" : "bg-read hover:bg-hover"} ${thread.unread ? "font-semibold" : ""}`}
+              className={`mail-row group grid cursor-pointer grid-cols-[28px_28px_minmax(120px,180px)_1fr_auto] items-center gap-2 border-b border-line px-2 ${active ? "bg-selected" : thread.unread ? "hover:bg-hover" : "bg-read hover:bg-hover"} ${thread.unread ? "font-semibold" : ""}`}
               style={{ boxShadow: mail.query.accountId ? undefined : `inset 3px 0 0 ${thread.accountColor}` }}
               onClick={() => void mail.openThread(thread)}
               onKeyDown={(event) => {
@@ -189,17 +261,47 @@ export function MessageList({ className = "" }: { className?: string }) {
                 {thread.fromName.trim() && thread.fromEmail && <div className="truncate text-xs font-normal text-muted opacity-70">{thread.fromEmail}</div>}
               </div>
               <div className="min-w-0 truncate">
+                {localLabels
+                  .filter((label) => thread.localLabelIds?.includes(label.id))
+                  .map((label) => (
+                    <span key={label.id} className="mr-1.5 inline-block max-w-32 truncate rounded px-1.5 align-middle text-xs font-medium leading-5 text-white" style={{ background: label.color || LOCAL_LABEL_COLORS[0] }}>
+                      {label.name}
+                    </span>
+                  ))}
                 <span>{thread.subject || "(no subject)"}</span>
                 <span className="font-normal text-muted"> — {thread.snippet}</span>
                 {thread.hasAttachments && <span className="ml-1 inline-block align-middle text-muted"><IconPaperclip /></span>}
               </div>
-              <div className="flex items-center gap-2 pr-2 text-xs text-muted">
+              <div className="relative flex h-full items-center gap-2 pr-2 text-xs text-muted">
                 {!mail.query.accountId && (
                   <span className="max-w-45 truncate rounded-full px-2 py-0.5 font-medium text-white" style={{ background: thread.accountColor }} title={thread.accountEmail}>
                     {thread.accountEmail}
                   </span>
                 )}
                 {thread.snoozeUntil ? `Until ${formatListDate(thread.snoozeUntil)}` : thread.scheduledId ? `Sends ${formatListDate(thread.date)}` : formatListDate(thread.date)}
+                {!thread.scheduledId && (
+                  <div
+                    className={`absolute inset-y-0 right-0 hidden items-center gap-0.5 pl-3 pr-1 font-normal text-ink group-hover:flex group-focus-within:flex ${active ? "bg-selected" : "bg-hover"}`}
+                  >
+                    {!inTrash && mail.query.folder !== "spam" && rowAction("Archive", "archive", <IconArchive />)}
+                    {inTrash ? rowAction("Restore to the inbox", "untrash", <IconRestore />) : rowAction("Move to Trash", "trash", <IconTrash />)}
+                    {inTrash && (
+                      <button
+                        type="button"
+                        className="icon-btn hover:bg-line hover:text-danger"
+                        title="Delete forever"
+                        aria-label="Delete forever"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          mail.deleteForever([{ accountId: thread.accountId, threadId: thread.threadId }]);
+                        }}
+                      >
+                        <IconTrashForever />
+                      </button>
+                    )}
+                    {thread.unread ? rowAction("Mark as read", "read", <IconRead />) : rowAction("Mark as unread", "unread", <IconUnread />)}
+                  </div>
+                )}
               </div>
             </div>
           );
