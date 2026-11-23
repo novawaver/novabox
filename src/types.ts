@@ -87,6 +87,8 @@ export type ThreadSummary = {
   previewTo?: string | null;
   /** Ids of the Novabox labels on the conversation. */
   localLabelIds?: string[];
+  /** Scheduled with Gmail's own "schedule send": `date` is when it goes out. Changed or cancelled in Gmail. */
+  remoteScheduled?: boolean;
 };
 
 export type Template = {

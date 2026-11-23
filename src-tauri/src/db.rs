@@ -227,6 +227,34 @@ fn local_label_threads(conn: &Connection) -> Result<Vec<(String, String, String)
     rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
 }
 
+/// Messages this account wrote that were due to go out within the last two days and are
+/// still in no folder: scheduled in Gmail, and by now sent or cancelled there.
+pub fn overdue_scheduled(conn: &Connection, account: &Account, now: i64) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT id, from_email, label_ids FROM messages INDEXED BY idx_messages_date
+             WHERE account_id = ?1 AND date > ?2 AND date <= ?3",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![account.id, now - 2 * 24 * 60 * 60 * 1000, now], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    let mine = |email: &str| {
+        email.eq_ignore_ascii_case(&account.email) || account.send_as.iter().any(|alias| alias.email.eq_ignore_ascii_case(email))
+    };
+    Ok(rows
+        .into_iter()
+        .filter(|(_, from_email, labels)| {
+            mine(from_email) && label_ids_in(labels).all(|label| label_flag(label) & (INBOX | SENT | DRAFT | TRASH | SPAM) == 0)
+        })
+        .map(|(id, _, _)| id)
+        .collect())
+}
+
 /// The messages of a conversation that are in Trash.
 pub fn trashed_in_thread(conn: &Connection, account_id: &str, thread_id: &str) -> Result<Vec<String>, String> {
     Ok(thread_labels(conn, account_id, thread_id)?
@@ -987,7 +1015,15 @@ pub fn query_mailbox(conn: &Connection, query: &ThreadQuery) -> Result<Mailbox, 
         }
     }
     counts.snoozed = snoozed.len() as i64;
-    counts.scheduled = scheduled.len() as i64;
+    // Mail waiting in Gmail's own "schedule send". Gmail hands it over like any message, but
+    // in no folder at all and dated when it will go out, which is how it is told apart here.
+    let now = crate::util::now_secs() * 1000;
+    let waiting = move |message: &Lean| message.date > now && message.flags & (INBOX | SENT | DRAFT | TRASH | SPAM) == 0;
+    let waiting_count = conversations
+        .iter()
+        .filter(|conversation| loaded.messages_of(conversation).iter().any(waiting))
+        .count();
+    counts.scheduled = (scheduled.len() + waiting_count) as i64;
     let mut labels = load_labels(conn, &account_filter)?;
     labels.retain(|label| in_group(&label.account_id));
     // One pass over the conversations, counting each once per label it has unread mail under.
@@ -1032,7 +1068,16 @@ pub fn query_mailbox(conn: &Connection, query: &ThreadQuery) -> Result<Mailbox, 
     let offset = query.offset.max(0) as usize;
     let limit = query.limit.clamp(1, 200) as usize;
     if query.folder == "scheduled" && search.is_empty() {
-        let threads = scheduled_threads(&scheduled, &account_pairs(&accounts));
+        // What Novabox will send itself, together with what is waiting in Gmail, soonest first.
+        let mut threads = scheduled_threads(&scheduled, &account_pairs(&accounts));
+        let lines = summarize(&loaded, |_| true, waiting);
+        let every: Vec<&Line> = lines.iter().collect();
+        let mut remote = hydrate(conn, &owners, conversations, &every, &local_ids)?;
+        for thread in &mut remote {
+            thread.remote_scheduled = true;
+        }
+        threads.extend(remote);
+        threads.sort_by(|a, b| a.date.cmp(&b.date).then(a.thread_id.cmp(&b.thread_id)));
         let total = threads.len();
         let threads = threads.into_iter().skip(offset).take(limit).collect();
         return Ok(Mailbox { accounts, labels, local_labels, threads, has_more: total > offset + limit, total, counts });
@@ -1617,6 +1662,7 @@ fn hydrate(
                     body_html: None,
                     preview_to: None,
                     local_label_ids: local_ids(line.conversation),
+                    remote_scheduled: false,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -1847,6 +1893,7 @@ fn scheduled_threads(items: &[ScheduledMail], accounts: &HashMap<String, (String
             body_html: Some(item.request.html.clone()),
             preview_to: Some(item.request.to.clone()),
             local_label_ids: Vec::new(),
+            remote_scheduled: false,
         });
     }
     threads
@@ -1979,6 +2026,47 @@ mod tests {
         assert_eq!(found.threads.len(), 1);
         assert_eq!(found.threads[0].subject, "Sale");
         assert!(ask(Some(vec![]), None).threads.is_empty());
+    }
+
+    #[test]
+    fn mail_scheduled_in_gmail_is_listed_as_scheduled() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let later = crate::util::now_secs() * 1000 + 3_600_000;
+        // Gmail reports a message waiting in its own schedule with no labels and a date ahead.
+        let waiting = StoredMessage { date: later, ..message("s", "t9", &[], "Check Here", "see you then") };
+        upsert_message(&conn, &waiting).unwrap();
+        // Archived mail has no labels either, but it was received in the past.
+        upsert_message(&conn, &message("a", "t1", &[], "Old news", "filed away")).unwrap();
+        upsert_message(&conn, &message("b", "t2", &["INBOX", "UNREAD"], "Hello", "new mail")).unwrap();
+        let ask = |folder: &str| {
+            query_mailbox(
+                &conn,
+                &ThreadQuery {
+                    account_id: None,
+                    account_ids: None,
+                    folder: folder.into(),
+                    label_id: None,
+                    category: Some("all".into()),
+                    search: None,
+                    limit: 50,
+                    offset: 0,
+                    inbox_tabs: InboxTabs::default(),
+                },
+            )
+            .unwrap()
+        };
+        let scheduled = ask("scheduled");
+        assert_eq!(scheduled.counts.scheduled, 1);
+        assert_eq!(scheduled.threads.len(), 1);
+        assert_eq!(scheduled.threads[0].subject, "Check Here");
+        assert_eq!(scheduled.threads[0].date, later);
+        assert!(scheduled.threads[0].remote_scheduled && scheduled.threads[0].scheduled_id.is_none());
+        assert_eq!(ask("inbox").threads.len(), 1);
+        // Once Gmail has sent it, it is ordinary sent mail.
+        set_labels(&conn, "acct", "s", &["SENT".to_string()]).unwrap();
+        assert!(ask("scheduled").threads.is_empty());
+        assert_eq!(ask("sent").threads.len(), 1);
     }
 
     #[test]

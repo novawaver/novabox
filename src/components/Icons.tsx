@@ -40,6 +40,10 @@ export function IconUnread({ className = "h-[18px] w-[18px]" }: { className?: st
 export function IconRead({ className = "h-[18px] w-[18px]" }: { className?: string }) {
   return <svg viewBox="0 0 24 24" className={className} {...actionStroke}><path d="M3 10.5 12 4l9 6.5V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" /><path d="m3.5 11 8.5 5.5 8.5-5.5" /></svg>;
 }
+/** A clock with a line through it, for ending a snooze. */
+export function IconUnsnooze({ className = "h-[18px] w-[18px]" }: { className?: string }) {
+  return <svg viewBox="0 0 24 24" className={className} {...actionStroke}><path d="M6.3 6.3A8 8 0 0 0 17.7 17.7M20 12a8 8 0 0 0-10.2-7.7" /><path d="M12 8v2.5" /><path d="m4 4 16 16" /></svg>;
+}
 /** A pencil, for editing. */
 export function IconPencil({ className = "h-[14px] w-[14px]" }: { className?: string }) {
   return <svg viewBox="0 0 24 24" className={className} {...actionStroke}><path d="M4 20h4L19 9l-4-4L4 16Z" /><path d="m13.5 6.5 4 4" /></svg>;

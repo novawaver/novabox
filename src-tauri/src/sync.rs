@@ -146,6 +146,9 @@ async fn sync_inner(app: &AppHandle, account_id: &str, eager: bool) -> Result<()
                 eprintln!("Novabox {label} sync: {err}");
             }
         }
+        if let Err(err) = settle_scheduled(app, &account).await {
+            eprintln!("Novabox scheduled mail: {err}");
+        }
         if label_check_due(app, account_id) {
             match check_labels(app, &account).await {
                 Ok(()) => label_check_done(app, account_id),
@@ -218,6 +221,34 @@ async fn backfill_page(app: &AppHandle, account: &mut Account) -> Result<(), Str
         }
     }
     save_account(app, account)
+}
+
+/// Mail scheduled in Gmail sits in no folder until it goes out. Once its time has passed,
+/// reads its labels again, in case the change to Sent (or its cancelling) was missed.
+async fn settle_scheduled(app: &AppHandle, account: &Account) -> Result<(), String> {
+    let now = crate::util::now_secs() * 1000;
+    let overdue = with_db(app, |conn| db::overdue_scheduled(conn, account, now))?;
+    let data_dir = app.state::<AppState>().data_dir.clone();
+    let mut changed = false;
+    for id in overdue.iter().take(50) {
+        match gmail::message_labels(app, &account.id, id).await {
+            Ok(labels) if labels.is_empty() => {}
+            Ok(labels) => {
+                with_db(app, |conn| db::set_labels(conn, &account.id, id, &labels))?;
+                changed = true;
+            }
+            Err(err) if err.starts_with("gmail_404") => {
+                with_db(app, |conn| db::delete_message(conn, &account.id, id))?;
+                files::remove_message_files(&data_dir, &account.id, id);
+                changed = true;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    if changed {
+        let _ = app.emit("mail://updated", json!({}));
+    }
+    Ok(())
 }
 
 /// Spam and Trash never come back from the normal list calls, so pull them separately.
@@ -437,6 +468,22 @@ fn entry_message_id(entry: &Value) -> Option<String> {
 }
 
 pub(crate) fn notify_new_mail(app: &AppHandle, account: &Account, fresh: &[String]) {
+    // Only unread mail in the inbox is news. Other messages turn up as "added" too: mail the
+    // account sent from elsewhere, drafts, and mail waiting in Gmail's own schedule.
+    let fresh: Vec<String> = with_db(app, |conn| {
+        let mut arrived = Vec::new();
+        for id in fresh {
+            let labels = db::message_labels(conn, &account.id, id)?.unwrap_or_default();
+            if labels.iter().any(|label| label == "INBOX") && labels.iter().any(|label| label == "UNREAD") {
+                arrived.push(id.clone());
+            }
+        }
+        Ok(arrived)
+    })
+    .unwrap_or_default();
+    if fresh.is_empty() {
+        return;
+    }
     let thread = with_db(app, |conn| {
         let thread_id = lookup_or_empty(conn, &account.id, &fresh[0])?;
         db::get_thread(conn, &account.id, &thread_id)

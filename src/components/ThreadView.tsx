@@ -3,7 +3,7 @@ import { useDismiss } from "../useDismiss";
 import { formatBytes, formatFullDate, formatPeople, initials, personName } from "../format";
 import { blockPageMenu, openExternal } from "../platform";
 import { cleanEmail } from "../sanitize";
-import { IconArchive, IconBack, IconStar, IconTrash } from "./Icons";
+import { IconArchive, IconBack, IconClock, IconRestore, IconStar, IconTrash, IconTrashForever, IconUnread, IconUnsnooze } from "./Icons";
 import { WhenMenu } from "./WhenMenu";
 import { useMail } from "../state/MailProvider";
 import { LOCAL_LABEL_COLORS, type MessageDetail } from "../types";
@@ -23,6 +23,9 @@ export function ThreadView() {
   // Novabox labels are on the conversation's row in the list, not on its messages.
   const row = mail.threads.find((item) => item.accountId === thread.accountId && item.threadId === thread.threadId);
   const localLabels = mail.localLabels.filter((label) => row?.localLabelIds?.includes(label.id));
+  // Waiting in Gmail's own "schedule send": in no folder yet, and dated when it will go out.
+  const folders = ["INBOX", "SENT", "DRAFT", "TRASH", "SPAM"];
+  const waiting = thread.scheduledId ? undefined : thread.messages.find((message) => message.date > Date.now() && !message.labelIds.some((label) => folders.includes(label)));
   return (
     <section className="flex min-w-0 flex-1 flex-col bg-panel">
       <div className="flex items-center gap-1 border-b border-line px-2 py-1">
@@ -37,23 +40,23 @@ export function ThreadView() {
           </>
         ) : (
           <>
-            <button type="button" className="icon-btn" aria-label="Archive" onClick={() => void mail.act("archive")}><IconArchive /></button>
+            <button type="button" className="icon-btn" aria-label="Archive" title="Archive" onClick={() => void mail.act("archive")}><IconArchive /></button>
             {inTrash ? (
               <>
-                <button type="button" className="tool-btn" title="Move back to the inbox" onClick={() => void mail.act("untrash")}>Restore</button>
-                <button type="button" className="tool-btn hover:text-danger" title="Delete for good. This can't be undone." onClick={() => mail.deleteForever()}>Delete forever</button>
+                <button type="button" className="icon-btn" aria-label="Restore" title="Restore to the inbox" onClick={() => void mail.act("untrash")}><IconRestore /></button>
+                <button type="button" className="icon-btn hover:text-danger" aria-label="Delete forever" title="Delete forever. This can't be undone." onClick={() => mail.deleteForever()}><IconTrashForever /></button>
               </>
             ) : (
               <button type="button" className="icon-btn" aria-label="Delete" title="Move to Trash" onClick={() => void mail.act("trash")}><IconTrash /></button>
             )}
-            <button type="button" className="icon-btn" aria-label="Star" onClick={() => void mail.act(thread.messages.some((message) => message.starred) ? "unstar" : "star")}><IconStar filled={thread.messages.some((message) => message.starred)} /></button>
-            <button type="button" className="tool-btn" onClick={() => void mail.act("unread")}>Unread</button>
+            <button type="button" className="icon-btn" aria-label="Star" title="Star" onClick={() => void mail.act(thread.messages.some((message) => message.starred) ? "unstar" : "star")}><IconStar filled={thread.messages.some((message) => message.starred)} /></button>
+            <button type="button" className="icon-btn" aria-label="Mark as unread" title="Mark as unread" onClick={() => void mail.act("unread")}><IconUnread /></button>
             <div ref={snoozeArea} className="relative">
               {mail.query.folder === "snoozed" ? (
-                <button type="button" className="tool-btn" onClick={() => void mail.unsnooze()}>Unsnooze</button>
+                <button type="button" className="icon-btn" aria-label="Unsnooze" title="Unsnooze" onClick={() => void mail.unsnooze()}><IconUnsnooze /></button>
               ) : (
                 <>
-                  <button type="button" className="tool-btn" aria-label="Snooze" onClick={() => setSnoozeOpen((open) => !open)}>Snooze</button>
+                  <button type="button" className={`icon-btn ${snoozeOpen ? "bg-hover text-ink" : ""}`} aria-label="Snooze" title="Snooze" aria-expanded={snoozeOpen} onClick={() => setSnoozeOpen((open) => !open)}><IconClock /></button>
                   {snoozeOpen && <WhenMenu title="Snooze until" onPick={(at) => void mail.snooze(at)} onClose={closeSnooze} />}
                 </>
               )}
@@ -77,6 +80,11 @@ export function ThreadView() {
             <span key={label.id} className="rounded px-2 py-0.5 text-xs font-medium text-white" style={{ background: label.color || LOCAL_LABEL_COLORS[0] }}>{label.name}</span>
           ))}
         </div>
+        {waiting && (
+          <p className="mt-4 rounded-xl bg-selected px-3 py-2 text-sm">
+            Scheduled in Gmail to send {formatFullDate(waiting.date)}. To change or cancel it, open Scheduled in Gmail.
+          </p>
+        )}
         <div className="mt-6 space-y-4">
           {thread.messages.map((message, index) => (
             <MessageCard key={message.id} message={message} startOpen={index === thread.messages.length - 1} />

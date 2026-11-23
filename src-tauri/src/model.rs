@@ -117,6 +117,9 @@ pub struct ThreadSummary {
     pub preview_to: Option<String>,
     /// The Novabox labels on the conversation (see `LocalLabel`).
     pub local_label_ids: Vec<String>,
+    /// Scheduled with the mail service's own "schedule send" (Gmail's), not in Novabox:
+    /// `date` is when it goes out, and it is changed or cancelled there.
+    pub remote_scheduled: bool,
 }
 
 /// A label that exists only in Novabox on this PC. It is put on whole conversations, of any

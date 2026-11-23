@@ -1,5 +1,5 @@
 import { formatListDate, personName, threadKey } from "../format";
-import { IconArchive, IconBack, IconNext, IconPaperclip, IconRead, IconRefresh, IconRestore, IconStar, IconTrash, IconTrashForever, IconUnread } from "./Icons";
+import { IconArchive, IconBack, IconClock, IconLabel, IconNext, IconPaperclip, IconRead, IconRefresh, IconRestore, IconSpam, IconStar, IconTrash, IconTrashForever, IconUnread, IconUnsnooze } from "./Icons";
 import { LocalLabelDialog } from "./LocalLabelDialog";
 import { WhenMenu } from "./WhenMenu";
 import { useMail } from "../state/MailProvider";
@@ -91,24 +91,24 @@ export function MessageList({ className = "" }: { className?: string }) {
         <button type="button" className="icon-btn" aria-label="Archive" title="Archive" disabled={!hasTargets} onClick={() => void mail.act("archive")}><IconArchive /></button>
         {inTrash ? (
           <>
-            <button type="button" className="tool-btn" title="Move back to the inbox" disabled={!hasTargets} onClick={() => void mail.act("untrash")}>Restore</button>
-            <button type="button" className="tool-btn hover:text-danger" title="Delete for good. This can't be undone." disabled={!hasTargets} onClick={() => mail.deleteForever()}>Delete forever</button>
+            <button type="button" className="icon-btn" aria-label="Restore" title="Restore to the inbox" disabled={!hasTargets} onClick={() => void mail.act("untrash")}><IconRestore /></button>
+            <button type="button" className="icon-btn hover:text-danger" aria-label="Delete forever" title="Delete forever. This can't be undone." disabled={!hasTargets} onClick={() => mail.deleteForever()}><IconTrashForever /></button>
           </>
         ) : (
           <button type="button" className="icon-btn" aria-label="Delete" title="Move to Trash" disabled={!hasTargets} onClick={() => void mail.act("trash")}><IconTrash /></button>
         )}
-        <button type="button" className="tool-btn" aria-label="Mark read" disabled={!hasTargets} onClick={() => void mail.act("read")}>Read</button>
-        <button type="button" className="tool-btn" aria-label="Report spam" disabled={!hasTargets} onClick={() => void mail.act("spam")}>Spam</button>
+        <button type="button" className="icon-btn" aria-label="Mark as read" title="Mark as read" disabled={!hasTargets} onClick={() => void mail.act("read")}><IconRead /></button>
+        <button type="button" className="icon-btn" aria-label="Report spam" title="Report spam" disabled={!hasTargets} onClick={() => void mail.act("spam")}><IconSpam /></button>
         {mail.query.folder === "snoozed" ? (
-          <button type="button" className="tool-btn" disabled={!hasTargets} onClick={() => void mail.unsnooze()}>Unsnooze</button>
+          <button type="button" className="icon-btn" aria-label="Unsnooze" title="Unsnooze" disabled={!hasTargets} onClick={() => void mail.unsnooze()}><IconUnsnooze /></button>
         ) : mail.query.folder !== "scheduled" && (
           <div className="relative">
-            <button type="button" className={`tool-btn ${menu === "snooze" ? "bg-hover text-ink" : ""}`} aria-label="Snooze" aria-expanded={menu === "snooze"} disabled={!hasTargets} onClick={() => setMenu((open) => (open === "snooze" ? null : "snooze"))}>Snooze</button>
+            <button type="button" className={`icon-btn ${menu === "snooze" ? "bg-hover text-ink" : ""}`} aria-label="Snooze" title="Snooze" aria-expanded={menu === "snooze"} disabled={!hasTargets} onClick={() => setMenu((open) => (open === "snooze" ? null : "snooze"))}><IconClock /></button>
             {menu === "snooze" && <WhenMenu title="Snooze until" onPick={(at) => void mail.snooze(at)} onClose={closeMenu} />}
           </div>
         )}
         <div className="relative">
-          <button type="button" className={`tool-btn ${menu === "label" ? "bg-hover text-ink" : ""}`} aria-label="Label" aria-expanded={menu === "label"} disabled={!hasTargets} onClick={() => setMenu((open) => (open === "label" ? null : "label"))}>Label</button>
+          <button type="button" className={`icon-btn ${menu === "label" ? "bg-hover text-ink" : ""}`} aria-label="Label" title="Label" aria-expanded={menu === "label"} disabled={!hasTargets} onClick={() => setMenu((open) => (open === "label" ? null : "label"))}><IconLabel /></button>
           {menu === "label" && (
             <div className="absolute left-0 top-9 z-20 max-h-[70vh] w-60 overflow-y-auto rounded-xl border border-line bg-panel p-2 shadow-[var(--shadow)]">
               {mail.mode === "live" && (
@@ -268,6 +268,7 @@ export function MessageList({ className = "" }: { className?: string }) {
                       {label.name}
                     </span>
                   ))}
+                {thread.remoteScheduled && <span className="mr-1.5 inline-block rounded border border-line px-1.5 align-middle text-xs font-medium leading-5 text-muted">Scheduled in Gmail</span>}
                 <span>{thread.subject || "(no subject)"}</span>
                 <span className="font-normal text-muted"> — {thread.snippet}</span>
                 {thread.hasAttachments && <span className="ml-1 inline-block align-middle text-muted"><IconPaperclip /></span>}
@@ -278,8 +279,8 @@ export function MessageList({ className = "" }: { className?: string }) {
                     {thread.accountEmail}
                   </span>
                 )}
-                {thread.snoozeUntil ? `Until ${formatListDate(thread.snoozeUntil)}` : thread.scheduledId ? `Sends ${formatListDate(thread.date)}` : formatListDate(thread.date)}
-                {!thread.scheduledId && (
+                {thread.snoozeUntil ? `Until ${formatListDate(thread.snoozeUntil)}` : thread.scheduledId || thread.remoteScheduled ? `Sends ${formatListDate(thread.date)}` : formatListDate(thread.date)}
+                {!thread.scheduledId && !thread.remoteScheduled && (
                   <div
                     className={`absolute inset-y-0 right-0 hidden items-center gap-0.5 pl-3 pr-1 font-normal text-ink group-hover:flex group-focus-within:flex ${active ? "bg-selected" : "bg-hover"}`}
                   >

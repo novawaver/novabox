@@ -11,7 +11,8 @@ use tauri::{AppHandle, Manager};
 
 use crate::AppState;
 
-const RED: [u8; 3] = [0xD9, 0x30, 0x25];
+/// Blue, to stand apart from the red and orange of the app icon it sits on.
+const BLUE: [u8; 3] = [0x1A, 0x73, 0xE8];
 const WHITE: [u8; 3] = [0xFF, 0xFF, 0xFF];
 /// The tray icon is drawn at this size and scaled down by Windows, which keeps the digits sharp.
 const TRAY_SIZE: u32 = 64;
@@ -126,7 +127,7 @@ fn label(count: i64, cap: i64) -> String {
 fn overlay(count: i64) -> Image<'static> {
     let mut canvas = Canvas::new(OVERLAY_SIZE, OVERLAY_SIZE);
     let middle = OVERLAY_SIZE as f32 / 2.0;
-    canvas.disc(middle, middle, middle, RED);
+    canvas.disc(middle, middle, middle, BLUE);
     canvas.digits(middle, middle, middle, &label(count, 99), WHITE);
     canvas.into_image()
 }
@@ -177,7 +178,7 @@ fn tray_icon(icon: &Image<'_>, count: i64) -> Image<'static> {
     let (cx, cy) = (size - radius, size - radius);
     // A white rim keeps the badge apart from the icon behind it.
     canvas.disc(cx, cy, radius, WHITE);
-    canvas.disc(cx, cy, radius - size * 0.03, RED);
+    canvas.disc(cx, cy, radius - size * 0.03, BLUE);
     canvas.digits(cx, cy, radius - size * 0.03, &label(count, 9), WHITE);
     canvas.into_image()
 }
@@ -226,12 +227,12 @@ mod tests {
     }
 
     #[test]
-    fn overlay_is_a_red_disc_with_white_digits() {
+    fn overlay_is_a_blue_disc_with_white_digits() {
         let image = overlay(8);
         assert_eq!((image.width(), image.height()), (OVERLAY_SIZE, OVERLAY_SIZE));
-        // Clear outside the circle, red inside it, and the middle bar of the 8 in white.
+        // Clear outside the circle, blue inside it, and the middle bar of the 8 in white.
         assert_eq!(pixel(&image, 0, 0)[3], 0);
-        assert_eq!(pixel(&image, 3, 16), [RED[0], RED[1], RED[2], 255]);
+        assert_eq!(pixel(&image, 3, 16), [BLUE[0], BLUE[1], BLUE[2], 255]);
         assert_eq!(pixel(&image, 16, 16), [255, 255, 255, 255]);
         // Three characters still fit inside the circle.
         let wide = overlay(250);
@@ -249,8 +250,8 @@ mod tests {
         assert_eq!((image.width(), image.height()), (TRAY_SIZE, TRAY_SIZE));
         assert_eq!(pixel(&image, 4, 4), [0, 0, 255, 255]);
         let (cx, cy) = (TRAY_SIZE - 22, TRAY_SIZE - 22);
-        // Inside the badge: red around the digit, white on it.
-        assert_eq!(pixel(&image, cx - 14, cy), [RED[0], RED[1], RED[2], 255]);
+        // Inside the badge: blue around the digit, white on it.
+        assert_eq!(pixel(&image, cx - 14, cy), [BLUE[0], BLUE[1], BLUE[2], 255]);
         assert_eq!(pixel(&image, cx, cy), [255, 255, 255, 255]);
     }
 }
